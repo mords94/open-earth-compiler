@@ -27,7 +27,8 @@ def Stencil_Result : Type<Stencil_IsResultType, "a result">;
 
 def Stencil_Element : AnyTypeOf<[F32, F64]>;
 
-def Stencil_Index : Confined<I64ArrayAttr, [ArrayCount<3>]>;
+// def Stencil_Index : Confined<I64ArrayAttr, [ArrayCount<3>]>;
+def Stencil_Index : Confined<I64ArrayAttr, [ArrayMinCount<2>]>;
 def Stencil_Loop : Confined<I64ArrayAttr, [ArrayCount<4>]>;
 
 //===----------------------------------------------------------------------===//

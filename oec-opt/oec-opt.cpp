@@ -20,6 +20,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Conversion/LoopsToGPU/Passes.h"
+#include "Conversion/RaiseAffineToStencil/Passes.h"
 #include "Conversion/StencilToStandard/Passes.h"
 #include "Dialect/Stencil/Passes.h"
 #include "Dialect/Stencil/StencilDialect.h"
@@ -44,25 +45,27 @@ void registerTestGpuParallelLoopMappingPass();
 
 int main(int argc, char **argv) {
   registerAllPasses();
-  test::registerTestGpuParallelLoopMappingPass();
+  // test::registerTestGpuParallelLoopMappingPass();
 
   // Register the stencil passes
   registerStencilPasses();
   registerStencilConversionPasses();
+  registerStencilRaisingPasses();
 
   // Register the stencil pipelines
 #ifdef CUDA_BACKEND_ENABLED
-  registerGPUToCUBINPipeline();
+  // registerGPUToCUBINPipeline();
 #endif
 #ifdef ROCM_BACKEND_ENABLED
-  registerGPUToHSACOPipeline();
+  // registerGPUToHSACOPipeline();
 #endif
 
   mlir::DialectRegistry registry;
   registry.insert<stencil::StencilDialect>();
-  registry.insert<StandardOpsDialect>();
+  registry.insert<mlir::StandardOpsDialect>();
   registry.insert<scf::SCFDialect>();
   registry.insert<gpu::GPUDialect>();
+
   registerAllDialects(registry);
 
   return failed(

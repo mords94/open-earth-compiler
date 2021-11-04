@@ -9,6 +9,7 @@ set(LIBS
   
   Stencil
   StencilToStandard
+  RaiseAffineToStencil
   GPUToKernelAndRuntimeCalls
   ${CUDA_RUNTIME_LIBRARY}
 )

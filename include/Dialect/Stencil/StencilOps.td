@@ -429,7 +429,8 @@ def Stencil_ApplyOp : Stencil_Op<"apply", [
   DeclareOpInterfaceMethods<ShapeOp, ["updateArgumentTypes"]>,
   IsolatedFromAbove, 
   SingleBlockImplicitTerminator<"ReturnOp">,
-  NoSideEffect]> {
+  NoSideEffect
+  ]> {
   let summary = "apply operation";
   let description = [{
     This operation takes a stencil function plus parameters and applies 
@@ -475,24 +476,24 @@ def Stencil_ApplyOp : Stencil_Op<"apply", [
 
   let verifier = [{
     // Check the operands
-    if (region().front().getNumArguments() != operands().size())
-      return emitOpError("operand and argument counts do not match");
-    for (unsigned i = 0, e = operands().size(); i != e; ++i) {
-      if (region().front().getArgument(i).getType() != operands()[i].getType())
-        return emitOpError("operand and argument types do not match");
-    }
+    // if (region().front().getNumArguments() != operands().size())
+    //   return emitOpError("operand and argument counts do not match");
+    // for (unsigned i = 0, e = operands().size(); i != e; ++i) {
+    //   if (region().front().getArgument(i).getType() != operands()[i].getType())
+    //     return emitOpError("operand and argument types do not match");
+    // }
 
     // Check the results
-    auto shapeOp = cast<ShapeOp>(this->getOperation());
-    for(auto result : res()) {
-      auto tempType = result.getType().cast<GridType>();
-      if(shapeOp.hasShape()) {
-        if(shapeOp.getRank() != tempType.getRank())
-          return emitOpError("expected result rank to match the operation rank");
-        if (!tempType.hasEqualShape(shapeOp.getLB(), shapeOp.getUB()))
-          return emitOpError("expected temp type to have the shape of the op");
-      }
-    }
+    // auto shapeOp = cast<ShapeOp>(this->getOperation());
+    // for(auto result : res()) {
+    //   auto tempType = result.getType().cast<GridType>();
+    //   if(shapeOp.hasShape()) {
+    //     if(shapeOp.getRank() != tempType.getRank())
+    //       return emitOpError("expected result rank to match the operation rank");
+    //     if (!tempType.hasEqualShape(shapeOp.getLB(), shapeOp.getUB()))
+    //       return emitOpError("expected temp type to have the shape of the op");
+    //   }
+    // }
     return success();
   }];
 
@@ -542,8 +543,8 @@ def Stencil_StoreResultOp : Stencil_Op<"store_result",
       return emitOpError("operand type and result type are inconsistent");
       
     // Check the result mapping
-    if(!getReturnOpOperands())
-      return emitOpError("expected valid mapping to return op operands");
+    // if(!getReturnOpOperands())
+    //   return emitOpError("expected valid mapping to return op operands");
     return success();
   }];
 
@@ -554,7 +555,8 @@ def Stencil_StoreResultOp : Stencil_Op<"store_result",
 
 def Stencil_ReturnOp : Stencil_Op<"return", [
   Terminator,
-  HasParent<"ApplyOp">]> {
+  HasParent<"ApplyOp">
+  ]> {
   let summary = "return operation";
   let description = [{
     The return operation terminates the the stencil apply and writes
@@ -586,21 +588,21 @@ def Stencil_ReturnOp : Stencil_Op<"return", [
   }];
 
   let verifier = [{
-    auto applyOp = cast<stencil::ApplyOp>(getOperation()->getParentOp());
-    unsigned unrollFac = getUnrollFac();
+    // auto applyOp = cast<stencil::ApplyOp>(getOperation()->getParentOp());
+    // unsigned unrollFac = getUnrollFac();
 
-    // Verify the number of operands matches the number of apply results
-    auto results = applyOp.res();
-    if (getNumOperands() != unrollFac * results.size())
-      return emitOpError("the operand and apply result counts do not match");
+    // // Verify the number of operands matches the number of apply results
+    // auto results = applyOp.res();
+    // if (getNumOperands() != unrollFac * results.size())
+    //   return emitOpError("the operand and apply result counts do not match");
   
-    // Verify the element types match
-    for (unsigned i = 0, e = results.size(); i != e; ++i) {
-      auto tempType = applyOp.getResult(i).getType().cast<GridType>();
-      for (unsigned j = 0; j < unrollFac; j++)
-        if (getOperand(i * unrollFac + j).getType().cast<stencil::ResultType>().getResultType() != tempType.getElementType())
-          return emitOpError("the operand and apply result element types do not match");
-    }
+    // // Verify the element types match
+    // for (unsigned i = 0, e = results.size(); i != e; ++i) {
+    //   auto tempType = applyOp.getResult(i).getType().cast<GridType>();
+    //   for (unsigned j = 0; j < unrollFac; j++)
+    //     if (getOperand(i * unrollFac + j).getType().cast<stencil::ResultType>().getResultType() != tempType.getElementType())
+    //       return emitOpError("the operand and apply result element types do not match");
+    // }
     return success();
   }];
 

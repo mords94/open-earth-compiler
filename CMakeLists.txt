@@ -14,6 +14,7 @@ if(POLICY CMP0077)
 endif()
 
 project(oec-opt LANGUAGES CXX C)
+project(gen-stencil LANGUAGES CXX C)
 include(CheckLanguage)
 
 set(CMAKE_CXX_STANDARD 14 CACHE STRING "C++ standard to conform to")
@@ -42,13 +43,14 @@ include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${MLIR_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include)
+include_directories(${CUDA_DIR}/include)
 link_directories(${LLVM_BUILD_LIBRARY_DIR})
 add_definitions(${LLVM_DEFINITIONS})
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake/modules")
 include(sanitizers)
 
-set(CUDA_BACKEND_ENABLED 1 CACHE BOOL "Enable building the oec CUDA backend")
+set(CUDA_BACKEND_ENABLED 0 CACHE BOOL "Enable building the oec CUDA backend")
 set(ROCM_BACKEND_ENABLED 0 CACHE BOOL "Enable building the oec ROCM backend")
 if(CUDA_BACKEND_ENABLED)
   add_definitions(-DCUDA_BACKEND_ENABLED)
@@ -75,10 +77,10 @@ if (ROCM_BACKEND_ENABLED)
     message(SEND_ERROR "Building the oec ROCM backend requires AMDGPU")
   endif()
 
-  find_package(LLD REQUIRED CONFIG)
 endif()
-
+  
+find_package(LLD REQUIRED CONFIG)
 add_subdirectory(include)
 add_subdirectory(lib)
-add_subdirectory(test)
 add_subdirectory(oec-opt)
+add_subdirectory(gen-stencil)

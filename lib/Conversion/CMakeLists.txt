@@ -1,2 +1,3 @@
 add_subdirectory(LoopsToGPU)
 add_subdirectory(StencilToStandard)
+add_subdirectory(RaiseAffineToStencil)

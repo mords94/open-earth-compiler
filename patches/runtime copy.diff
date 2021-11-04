@@ -1,0 +1,283 @@
+diff --git a/mlir/include/mlir/Conversion/GPUCommon/GPUCommonPass.h b/mlir/include/mlir/Conversion/GPUCommon/GPUCommonPass.h
+index 61d62a3ef78c..d1fbdc846e94 100644
+--- a/mlir/include/mlir/Conversion/GPUCommon/GPUCommonPass.h
++++ b/mlir/include/mlir/Conversion/GPUCommon/GPUCommonPass.h
+@@ -8,6 +8,7 @@
+ #ifndef MLIR_CONVERSION_GPUCOMMON_GPUCOMMONPASS_H_
+ #define MLIR_CONVERSION_GPUCOMMON_GPUCOMMONPASS_H_
+ 
++#include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVMPass.h"
+ #include "mlir/Support/LLVM.h"
+ #include "llvm/IR/Module.h"
+ #include <vector>
+@@ -45,7 +46,9 @@ using LoweringCallback = std::function<std::unique_ptr<llvm::Module>(
+ /// instead uses a small wrapper library that exports a stable and conveniently
+ /// typed ABI on top of GPU runtimes such as CUDA or ROCm (HIP).
+ std::unique_ptr<OperationPass<ModuleOp>>
+-createGpuToLLVMConversionPass(StringRef gpuBinaryAnnotation = "");
++createGpuToLLVMConversionPass(StringRef gpuBinaryAnnotation = "",
++                              const LowerToLLVMOptions &options =
++                                  LowerToLLVMOptions::getDefaultOptions());
+ 
+ /// Collect a set of patterns to convert from the GPU dialect to LLVM.
+ void populateGpuToLLVMConversionPatterns(LLVMTypeConverter &converter,
+diff --git a/mlir/include/mlir/Conversion/Passes.td b/mlir/include/mlir/Conversion/Passes.td
+index aa228784e48a..61e4ee8b5498 100644
+--- a/mlir/include/mlir/Conversion/Passes.td
++++ b/mlir/include/mlir/Conversion/Passes.td
+@@ -109,6 +109,22 @@ def GpuToLLVMConversionPass : Pass<"gpu-to-llvm", "ModuleOp"> {
+   let options = [
+     Option<"gpuBinaryAnnotation", "gpu-binary-annotation", "std::string",
+            "", "Annotation attribute string for GPU binary">,
++    Option<"useAlignedAlloc", "use-aligned-alloc", "bool", /*default=*/"false",
++           "Use aligned_alloc in place of malloc for heap allocations">,
++    Option<"useBarePtrCallConv", "use-bare-ptr-memref-call-conv", "bool",
++           /*default=*/"false",
++           "Replace FuncOp's MemRef arguments with bare pointers to the MemRef "
++           "element types">,
++    Option<"emitCWrappers", "emit-c-wrappers", "bool", /*default=*/"false",
++           "Emit wrappers for C-compatible pointer-to-struct memref "
++           "descriptors">,
++    Option<"indexBitwidth", "index-bitwidth", "unsigned",
++           /*default=kDeriveIndexBitwidthFromDataLayout*/"0",
++           "Bitwidth of the index type, 0 to use size of machine word">,
++    Option<"dataLayout", "data-layout", "std::string",
++           /*default=*/"\"\"",
++           "String description (LLVM format) of the data layout that is "
++           "expected on the produced module">
+   ];
+ }
+ 
+diff --git a/mlir/lib/Conversion/GPUCommon/ConvertLaunchFuncToRuntimeCalls.cpp b/mlir/lib/Conversion/GPUCommon/ConvertLaunchFuncToRuntimeCalls.cpp
+index cee1d7ba20e3..515b85d2b2af 100644
+--- a/mlir/lib/Conversion/GPUCommon/ConvertLaunchFuncToRuntimeCalls.cpp
++++ b/mlir/lib/Conversion/GPUCommon/ConvertLaunchFuncToRuntimeCalls.cpp
+@@ -41,15 +41,35 @@ namespace {
+ class GpuToLLVMConversionPass
+     : public GpuToLLVMConversionPassBase<GpuToLLVMConversionPass> {
+ public:
+-  GpuToLLVMConversionPass(StringRef gpuBinaryAnnotation) {
++  GpuToLLVMConversionPass(StringRef gpuBinaryAnnotation,
++                          bool useBarePtrCallConv, bool emitCWrappers,
++                          unsigned indexBitwidth, bool useAlignedAlloc,
++                          const llvm::DataLayout &dataLayout) {
+     if (!gpuBinaryAnnotation.empty())
+       this->gpuBinaryAnnotation = gpuBinaryAnnotation.str();
++    this->useBarePtrCallConv = useBarePtrCallConv;
++    this->emitCWrappers = emitCWrappers;
++    this->indexBitwidth = indexBitwidth;
++    this->useAlignedAlloc = useAlignedAlloc;
++    this->dataLayout = dataLayout.getStringRepresentation();
+   }
+ 
+   // Run the dialect converter on the module.
+   void runOnOperation() override;
+ };
+ 
++/// Helper class to build cast operations that adapt the bitwidth of index and
++/// size arguments to match the target function parameters.
++class IndexCastBuilder {
++public:
++  IndexCastBuilder(unsigned indexBitwidth) : indexBitwidth(indexBitwidth) {}
++  Value create(Location loc, OpBuilder &builder, Value value,
++               Type paramType) const;
++
++private:
++  unsigned indexBitwidth;
++};
++
+ class FunctionCallBuilder {
+ public:
+   FunctionCallBuilder(StringRef functionName, Type returnType,
+@@ -57,7 +77,8 @@ public:
+       : functionName(functionName),
+         functionType(LLVM::LLVMFunctionType::get(returnType, argumentTypes)) {}
+   LLVM::CallOp create(Location loc, OpBuilder &builder,
+-                      ArrayRef<Value> arguments) const;
++                      ArrayRef<Value> arguments,
++                      const IndexCastBuilder *indexCastBuilder = nullptr) const;
+ 
+ private:
+   StringRef functionName;
+@@ -83,6 +104,9 @@ protected:
+   Type llvmIntPtrType = IntegerType::get(
+       context, this->getTypeConverter()->getPointerBitwidth(0));
+ 
++  IndexCastBuilder indexCastBuilder = {
++      this->getTypeConverter()->getIndexTypeBitwidth()};
++
+   FunctionCallBuilder moduleLoadCallBuilder = {
+       "mgpuModuleLoad",
+       llvmPointerType /* void *module */,
+@@ -291,7 +315,10 @@ private:
+ } // namespace
+ 
+ void GpuToLLVMConversionPass::runOnOperation() {
+-  LLVMTypeConverter converter(&getContext());
++  LowerToLLVMOptions options = {useBarePtrCallConv, emitCWrappers,
++                                indexBitwidth, useAlignedAlloc,
++                                llvm::DataLayout(this->dataLayout)};
++  LLVMTypeConverter converter(&getContext(), options);
+   OwningRewritePatternList patterns;
+   populateStdToLLVMConversionPatterns(converter, patterns);
+   populateGpuToLLVMConversionPatterns(converter, patterns, gpuBinaryAnnotation);
+@@ -302,8 +329,22 @@ void GpuToLLVMConversionPass::runOnOperation() {
+     signalPassFailure();
+ }
+ 
+-LLVM::CallOp FunctionCallBuilder::create(Location loc, OpBuilder &builder,
+-                                         ArrayRef<Value> arguments) const {
++Value IndexCastBuilder::create(Location loc, OpBuilder &builder, Value value,
++                               Type paramType) const {
++  // Only cast arguments of index or integer arguments if their bitwidth is
++  // lower than the bitwidth of the target function parameter.
++  if ((value.getType().isIndex() ||
++       value.getType().isSignlessInteger(indexBitwidth)) &&
++      paramType.getIntOrFloatBitWidth() > indexBitwidth) {
++    return builder.create<LLVM::ZExtOp>(loc, paramType, value);
++  }
++  return value;
++}
++
++LLVM::CallOp
++FunctionCallBuilder::create(Location loc, OpBuilder &builder,
++                            ArrayRef<Value> arguments,
++                            const IndexCastBuilder *indexCastBuilder) const {
+   auto module = builder.getBlock()->getParent()->getParentOfType<ModuleOp>();
+   auto function = [&] {
+     if (auto function = module.lookupSymbol<LLVM::LLVMFuncOp>(functionName))
+@@ -311,9 +352,22 @@ LLVM::CallOp FunctionCallBuilder::create(Location loc, OpBuilder &builder,
+     return OpBuilder(module.getBody()->getTerminator())
+         .create<LLVM::LLVMFuncOp>(loc, functionName, functionType);
+   }();
++  // Optionally cast the index arguments to extend the bitwidth of index or
++  // integer arguments to match the bitwidth of the function parameters.
++  SmallVector<Value, 4> castedArguments(arguments.begin(), arguments.end());
++  if (indexCastBuilder) {
++    castedArguments.reserve(arguments.size());
++    for (auto en : llvm::enumerate(arguments)) {
++      // Get the function parameter type.
++      auto paramType = const_cast<LLVM::LLVMFunctionType &>(functionType)
++                           .getParamType(en.index());
++      castedArguments[en.index()] =
++          indexCastBuilder->create(loc, builder, en.value(), paramType);
++    }
++  }
+   return builder.create<LLVM::CallOp>(
+       loc, const_cast<LLVM::LLVMFunctionType &>(functionType).getReturnType(),
+-      builder.getSymbolRefAttr(function), arguments);
++      builder.getSymbolRefAttr(function), castedArguments);
+ }
+ 
+ // Returns whether all operands are of LLVM type.
+@@ -356,7 +410,7 @@ LogicalResult ConvertHostRegisterOpToGpuRuntimeCallPattern::matchAndRewrite(
+   auto arguments = getTypeConverter()->promoteOperands(loc, op->getOperands(),
+                                                        operands, rewriter);
+   arguments.push_back(elementSize);
+-  hostRegisterCallBuilder.create(loc, rewriter, arguments);
++  hostRegisterCallBuilder.create(loc, rewriter, arguments, &indexCastBuilder);
+ 
+   rewriter.eraseOp(op);
+   return success();
+@@ -388,7 +442,9 @@ LogicalResult ConvertAllocOpToGpuRuntimeCallPattern::matchAndRewrite(
+   Type elementPtrType = this->getElementPtrType(memRefType);
+   auto stream = adaptor.asyncDependencies().front();
+   Value allocatedPtr =
+-      allocCallBuilder.create(loc, rewriter, {sizeBytes, stream}).getResult(0);
++      allocCallBuilder
++          .create(loc, rewriter, {sizeBytes, stream}, &indexCastBuilder)
++          .getResult(0);
+   allocatedPtr =
+       rewriter.create<LLVM::BitcastOp>(loc, elementPtrType, allocatedPtr);
+ 
+@@ -646,7 +702,8 @@ LogicalResult ConvertLaunchFuncOpToGpuRuntimeCallPattern::matchAndRewrite(
+                                   launchOp.blockSizeX(), launchOp.blockSizeY(),
+                                   launchOp.blockSizeZ(),
+                                   /*sharedMemBytes=*/zero, stream, kernelParams,
+-                                  /*extra=*/nullpointer});
++                                  /*extra=*/nullpointer},
++                                 &indexCastBuilder);
+ 
+   if (launchOp.asyncToken()) {
+     // Async launch: make dependent ops use the same stream.
+@@ -701,7 +758,8 @@ LogicalResult ConvertMemcpyOpToGpuRuntimeCallPattern::matchAndRewrite(
+       MemRefDescriptor(adaptor.dst()).alignedPtr(rewriter, loc));
+ 
+   auto stream = adaptor.asyncDependencies().front();
+-  memcpyCallBuilder.create(loc, rewriter, {dst, src, sizeBytes, stream});
++  memcpyCallBuilder.create(loc, rewriter, {dst, src, sizeBytes, stream},
++                           &indexCastBuilder);
+ 
+   rewriter.replaceOp(memcpyOp, {stream});
+ 
+@@ -709,8 +767,11 @@ LogicalResult ConvertMemcpyOpToGpuRuntimeCallPattern::matchAndRewrite(
+ }
+ 
+ std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+-mlir::createGpuToLLVMConversionPass(StringRef gpuBinaryAnnotation) {
+-  return std::make_unique<GpuToLLVMConversionPass>(gpuBinaryAnnotation);
++mlir::createGpuToLLVMConversionPass(StringRef gpuBinaryAnnotation,
++                                    const LowerToLLVMOptions &options) {
++  return std::make_unique<GpuToLLVMConversionPass>(
++      gpuBinaryAnnotation, options.useBarePtrCallConv, options.emitCWrappers,
++      options.indexBitwidth, options.useAlignedAlloc, options.dataLayout);
+ }
+ 
+ void mlir::populateGpuToLLVMConversionPatterns(
+diff --git a/mlir/test/Conversion/GPUCommon/lower-alloc-to-gpu-runtime-calls.mlir b/mlir/test/Conversion/GPUCommon/lower-alloc-to-gpu-runtime-calls.mlir
+index 4169f0e8191d..b210b9fc521c 100644
+--- a/mlir/test/Conversion/GPUCommon/lower-alloc-to-gpu-runtime-calls.mlir
++++ b/mlir/test/Conversion/GPUCommon/lower-alloc-to-gpu-runtime-calls.mlir
+@@ -1,4 +1,5 @@
+ // RUN: mlir-opt %s --gpu-to-llvm | FileCheck %s
++// RUN: mlir-opt %s --gpu-to-llvm="index-bitwidth=32" | FileCheck %s --check-prefix=CHECK32
+ 
+ module attributes {gpu.container_module} {
+   // CHECK-LABEL: llvm.func @main
+@@ -8,6 +9,8 @@ module attributes {gpu.container_module} {
+     %0 = gpu.wait async
+     // CHECK: %[[gep:.*]] = llvm.getelementptr {{.*}}[%[[size]]]
+     // CHECK: %[[size_bytes:.*]] = llvm.ptrtoint %[[gep]]
++    // CHECK32: %[[size_bytes:.*]] = llvm.ptrtoint
++    // CHECK32: {{%.*}} = llvm.zext %[[size_bytes:.*]] : i32 to i64
+     // CHECK: llvm.call @mgpuMemAlloc(%[[size_bytes]], %[[stream]])
+     %1, %2 = gpu.alloc async [%0] (%size) : memref<?xf32>
+     // CHECK: %[[float_ptr:.*]] = llvm.extractvalue {{.*}}[0]
+diff --git a/mlir/test/Conversion/GPUCommon/lower-launch-func-to-gpu-runtime-calls.mlir b/mlir/test/Conversion/GPUCommon/lower-launch-func-to-gpu-runtime-calls.mlir
+index 634385cf1a64..dc32dec2e093 100644
+--- a/mlir/test/Conversion/GPUCommon/lower-launch-func-to-gpu-runtime-calls.mlir
++++ b/mlir/test/Conversion/GPUCommon/lower-launch-func-to-gpu-runtime-calls.mlir
+@@ -1,4 +1,5 @@
+ // RUN: mlir-opt %s --gpu-to-llvm="gpu-binary-annotation=nvvm.cubin" | FileCheck %s
++// RUN: mlir-opt %s --gpu-to-llvm="gpu-binary-annotation=nvvm.cubin index-bitwidth=32" | FileCheck %s --check-prefix=CHECK32
+ // RUN: mlir-opt %s --gpu-to-llvm="gpu-binary-annotation=rocdl.hsaco" | FileCheck %s --check-prefix=ROCDL
+ 
+ module attributes {gpu.container_module} {
+@@ -28,6 +29,8 @@ module attributes {gpu.container_module} {
+   }
+ 
+   // CHECK: [[C8:%.*]] = llvm.mlir.constant(8 : index) : i64
++  // CHECK32: [[C8:%.*]] = llvm.mlir.constant(8 : index) : i32
++  // CHECK32: {{%.*}} = llvm.zext [[C8]] : i32 to i64
+   // CHECK: [[ADDRESSOF:%.*]] = llvm.mlir.addressof @[[GLOBAL]]
+   // CHECK: [[C0:%.*]] = llvm.mlir.constant(0 : index)
+   // CHECK: [[BINARY:%.*]] = llvm.getelementptr [[ADDRESSOF]]{{\[}}[[C0]], [[C0]]]
+diff --git a/mlir/test/Conversion/GPUCommon/lower-memcpy-to-gpu-runtime-calls.mlir b/mlir/test/Conversion/GPUCommon/lower-memcpy-to-gpu-runtime-calls.mlir
+index 162c2f4e838a..e665c825f037 100644
+--- a/mlir/test/Conversion/GPUCommon/lower-memcpy-to-gpu-runtime-calls.mlir
++++ b/mlir/test/Conversion/GPUCommon/lower-memcpy-to-gpu-runtime-calls.mlir
+@@ -1,4 +1,5 @@
+ // RUN: mlir-opt %s --gpu-to-llvm | FileCheck %s
++// RUN: mlir-opt %s --gpu-to-llvm="index-bitwidth=32" | FileCheck %s --check-prefix=CHECK32
+ 
+ module attributes {gpu.container_module} {
+ 
+@@ -7,6 +8,8 @@ module attributes {gpu.container_module} {
+     // CHECK: %[[t0:.*]] = llvm.call @mgpuStreamCreate
+     %t0 = gpu.wait async
+     // CHECK: %[[size_bytes:.*]] = llvm.ptrtoint
++    // CHECK32: %[[size_bytes:.*]] = llvm.ptrtoint
++    // CHECK32: {{%.*}} = llvm.zext %[[size_bytes:.*]] : i32 to i64
+     // CHECK: %[[src:.*]] = llvm.bitcast
+     // CHECK: %[[dst:.*]] = llvm.bitcast
+     // CHECK: llvm.call @mgpuMemcpy(%[[dst]], %[[src]], %[[size_bytes]], %[[t0]])
