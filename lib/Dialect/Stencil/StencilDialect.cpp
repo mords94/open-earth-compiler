@@ -4,13 +4,31 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/Support/LLVM.h"
+#include "mlir/Transforms/InliningUtils.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/ErrorHandling.h"
 #include <cstdint>
 
+// addInterfaces<AffineInlinerInterface>();
+
 using namespace mlir;
 using namespace mlir::stencil;
+
+namespace {
+struct StencilInlinerInterface : public DialectInlinerInterface {
+  using DialectInlinerInterface::DialectInlinerInterface;
+
+  bool isLegalToInline(Operation *call, Operation *callable,
+                       bool wouldBeCloned) const final {
+    return true;
+  }
+  bool isLegalToInline(Operation *, Region *, bool,
+                       BlockAndValueMapping &) const final {
+    return true;
+  }
+};
+} // end anonymous namespace
 
 //===----------------------------------------------------------------------===//
 // Stencil Dialect
@@ -23,7 +41,8 @@ StencilDialect::StencilDialect(mlir::MLIRContext *context)
 #define GET_OP_LIST
 #include "Dialect/Stencil/StencilOps.cpp.inc"
       >();
-      
+
+  addInterfaces<StencilInlinerInterface>();
   // Allow Stencil operations to exist in their generic form
   allowUnknownOperations();
 }

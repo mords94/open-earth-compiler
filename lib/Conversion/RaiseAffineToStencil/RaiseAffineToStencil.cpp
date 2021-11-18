@@ -149,7 +149,7 @@ public:
                                       result.getConvertedTypes(), funcResult);
 
     auto newFuncOp =
-        rewriter.create<FuncOp>(loc, "kernel", funcType, llvm::None);
+        rewriter.create<FuncOp>(loc, funcOp.getName(), funcType, llvm::None);
 
     rewriter.inlineRegionBefore(funcOp.getBody(), newFuncOp.getBody(),
                                 newFuncOp.end());
@@ -173,6 +173,14 @@ public:
     auto &entryBlock = funcOp.getBlocks().front();
     RaisingTypeConverter typeConverter(funcOp.getContext());
 
+    mlir::Type tempType;
+
+    for (auto &arg : funcOp.getArguments()) {
+      if ((tempType = arg.getType()).isa<stencil::TempType>()) {
+        break;
+      }
+    }
+
     // bail out if already populated with stencil.apply
     if (hasApplyOp(entryBlock)) {
       return success();
@@ -189,7 +197,7 @@ public:
     SmallVector<mlir::Type> storeOpResultTypes;
 
     funcOp.walk([&](stencil::StoreResultOp storeOp) mutable {
-      storeOpResultTypes.push_back(funcOp.getArgument(0).getType());
+      storeOpResultTypes.push_back(tempType);
     });
 
     auto applyOp = rewriter.create<stencil::ApplyOp>(
@@ -227,29 +235,6 @@ public:
     }
 
     rewriter.setInsertionPointToEnd(applyOp.getBody());
-
-    // auto returnType = ResultType::get(lastValue.getType());
-
-    // auto storeResultOp = rewriter.create<stencil::StoreResultOp>(
-    //     storeOp.getLoc(), returnType, storeOp.value());
-
-    // rewriter.create<stencil::ReturnOp>(storeOp.getLoc(), llvm::None,
-
-    // auto storeResultOp = rewriter.create<stencil::StoreResultOp>(
-    //     applyOp.getLoc(), returnType, lastValue);
-
-    // applyOp.walk([&](mlir::StoreOp storeOp) {
-    //   auto returnType = ResultType::get(storeOp.value().getType());
-
-    //   auto storeResultOp = rewriter.create<stencil::StoreResultOp>(
-    //       storeOp.getLoc(), returnType, storeOp.value());
-
-    //   storeOps.push_back(storeResultOp.getResult());
-
-    //   storeOp.erase();
-    // rewriter.create<stencil::ReturnOp>(storeOp.getLoc(), llvm::None,
-
-    // });
 
     for (auto &arg : funcOp.getArguments()) {
       if (!arg.use_empty()) {
@@ -318,9 +303,6 @@ public:
     auto returnType = ResultType::get(storeOp.value().getType());
     rewriter.create<stencil::StoreResultOp>(storeOp.getLoc(), returnType,
                                             storeOp.value());
-
-    // rewriter.create<stencil::ReturnOp>(storeOp.getLoc(), llvm::None,
-    //                                    storeResultOp.getResult());
 
     rewriter.eraseOp(storeOp);
 

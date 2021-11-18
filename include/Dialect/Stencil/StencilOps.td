@@ -405,13 +405,13 @@ def Stencil_StoreOp : Stencil_Op<"store", [
     if (!tempType.hasLargerOrEqualShape(shapeOp.getLB(), shapeOp.getUB()))
       return emitOpError("expected the temp type to be larger than the op shape");
 
-    if (!(dyn_cast<stencil::ApplyOp>(temp().getDefiningOp()) || 
-          dyn_cast<stencil::CombineOp>(temp().getDefiningOp())))
-      return emitOpError("output temp not result of an apply or a combine op");
-    if (llvm::count_if(field().getUsers(), [](Operation *op) { return isa_and_nonnull<stencil::LoadOp>(op); }) != 0)
-      return emitOpError("an output cannot be an input");  
-    if (llvm::count_if(field().getUsers(), [](Operation *op) { return isa_and_nonnull<stencil::StoreOp>(op); }) != 1)
-      return emitOpError("multiple stores to the same output");  
+    // if (!(dyn_cast<stencil::ApplyOp>(temp().getDefiningOp()) || 
+    //       dyn_cast<stencil::CombineOp>(temp().getDefiningOp())))
+    //   return emitOpError("output temp not result of an apply or a combine op");
+    // if (llvm::count_if(field().getUsers(), [](Operation *op) { return isa_and_nonnull<stencil::LoadOp>(op); }) != 0)
+    //   return emitOpError("an output cannot be an input");  
+    // if (llvm::count_if(field().getUsers(), [](Operation *op) { return isa_and_nonnull<stencil::StoreOp>(op); }) != 1)
+    //   return emitOpError("multiple stores to the same output");  
     
     if(!isa<stencil::CastOp>(field().getDefiningOp()))
       return emitOpError("expected the defining op of the field is a cast operation");
@@ -449,7 +449,7 @@ def Stencil_ApplyOp : Stencil_Op<"apply", [
   let results = (outs Variadic<Stencil_Temp>:$res);
   let regions = (region SizedRegion<1>:$region);
   let hasCanonicalizer = 1;
-  
+
   let builders = [
     OpBuilderDAG<(ins "TypeRange":$resultTypes, "ValueRange":$operands, "Optional<ArrayAttr>":$lb, "Optional<ArrayAttr>":$ub), 
     [{
