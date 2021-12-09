@@ -1,4 +1,3 @@
-
 #include "Conversion/StencilToStandard/Passes.h"
 #include "Dialect/Stencil/Passes.h"
 #include "Dialect/Stencil/StencilDialect.h"
@@ -23,6 +22,7 @@
 #include "mlir/Parser.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Target/LLVMIR.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/Passes.h"
 #include "rapidjson/document.h"
@@ -59,7 +59,35 @@ static cl::opt<std::string> jsonFileName(cl::Positional,
                                          cl::value_desc("json filename"));
 
 static cl::opt<bool> enableOpt("opt", cl::desc("Enable optimizations"));
-static cl::opt<bool> enableLower("lower", cl::desc("Enable lowering to llvm"));
+
+namespace {
+enum Action {
+  DumpKernelsOnly,
+  DumpStencil,
+  DumpStencilShapes,
+  DumpStandard,
+  DumpMLIRLLVM,
+  DumpLLVMIR,
+  RunJIT
+};
+}
+static cl::opt<enum Action> emitAction(
+    "emit", cl::init(DumpStencil),
+    cl::desc("Select the kind of output desired"),
+    cl::values(clEnumValN(DumpKernelsOnly, "kernels-only",
+                          "output the processed kernels in stencil MLIR")),
+    cl::values(clEnumValN(DumpStencil, "mlir-stencil",
+                          "output the stencil MLIR dump")),
+    cl::values(clEnumValN(DumpStencilShapes, "mlir-stencil-shapes",
+                          "output the stencil with shapes MLIR dump")),
+    cl::values(clEnumValN(DumpStandard, "mlir-std",
+                          "output the standard MLIR dump")),
+    cl::values(clEnumValN(DumpMLIRLLVM, "mlir-llvm",
+                          "output the MLIR dump after llvm lowering")),
+    cl::values(clEnumValN(DumpLLVMIR, "llvm", "output the LLVM IR dump")),
+    cl::values(
+        clEnumValN(RunJIT, "jit",
+                   "JIT the code and run it by invoking the main function")));
 
 llvm::StringMap<mlir::FuncOp> functionMap;
 
@@ -175,7 +203,7 @@ public:
   void setType(mlir::Type type) { this->type = type; }
 
   void setId(size_t id) { this->idx = id; }
-  size_t getId() { this->idx; }
+  size_t getId() { return this->idx; }
 
   ArrayRef<int64_t> getBegin() { return this->begin; }
   void setBegin(SmallVector<int64_t> begin) { this->begin = begin; }
@@ -410,7 +438,7 @@ int processLoops(Document &document, MLIRContext &context,
       }
     }
 
-    // TODO: Think about this
+    // TODO: Figure out unused
     // for (auto &argName : readArgNames) {
     //   if (storeMap.count(argName) == 1) {
     //     storeMap[argName].erase();
@@ -429,7 +457,7 @@ int processLoops(Document &document, MLIRContext &context,
         createI64ArrayAttr(createI64VectorFromJsonArray(l["end"].GetArray()));
 
     for (auto &argName : writeArgNames) {
-      auto storeOp = builder.create<stencil::StoreOp>(
+      /*auto storeOp = */ builder.create<stencil::StoreOp>(
           callOp.getLoc(), callOp.getResult(0), castMap[argName], begin, end);
 
       // storeMap[argName] = storeOp;
@@ -437,6 +465,29 @@ int processLoops(Document &document, MLIRContext &context,
     }
   }
 
+  return 0;
+}
+
+int translateAndPrintLLVMIR(mlir::ModuleOp module) {
+  llvm::LLVMContext llvmContext;
+  auto llvmModule = mlir::translateModuleToLLVMIR(module, llvmContext);
+  if (!llvmModule) {
+    llvm::errs() << "Failed to emit LLVM IR\n";
+    return -1;
+  }
+
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  mlir::ExecutionEngine::setupTargetTriple(llvmModule.get());
+
+  auto optPipeline = mlir::makeOptimizingTransformer(
+      /*optLevel=*/enableOpt ? 3 : 0, /*sizeLevel=*/0,
+      /*targetMachine=*/nullptr);
+  if (auto err = optPipeline(llvmModule.get())) {
+    llvm::errs() << "Failed to optimize LLVM IR " << err << "\n";
+    return -1;
+  }
+  llvm::outs() << *llvmModule << "\n";
   return 0;
 }
 
@@ -470,37 +521,44 @@ int main(int argc, char **argv) {
   processLoops(document, context, newModule, module);
 
   mlir::PassManager pm(&context);
-  applyPassManagerCLOptions(pm);
 
   pm.addPass(mlir::createInlinerPass());
+  pm.addPass(mlir::createEraseNonStencilProgramsPass());
 
-  if (mlir::failed(pm.run(*newModule))) {
-    llvm::errs() << "Failed to run inliner pass";
-    return -1;
+  if (emitAction >= Action::DumpStencilShapes) {
+    pm.addNestedPass<mlir::FuncOp>(mlir::createShapeInferencePass());
   }
 
-  // <TODO: move this to a pass>
-  newModule->walk([](mlir::FuncOp funcOp) {
-    if (!StencilDialect::isStencilProgram(funcOp)) {
-      funcOp.erase();
-    }
-  });
-  // </TODO: move this to a pass>
-
-  if (enableLower) {
-    pm.addNestedPass<mlir::FuncOp>(mlir::createShapeInferencePass());
+  if (emitAction >= Action::DumpStandard) {
     pm.addPass(mlir::createConvertStencilToStandardPass());
-    pm.addPass(mlir::createCSEPass());
-    pm.addPass(mlir::createCanonicalizerPass());
+    if (enableOpt) {
+      pm.addPass(mlir::createCSEPass());
+      pm.addPass(mlir::createCanonicalizerPass());
+    }
+    pm.addPass(mlir::createLowerAffinePass());
+  }
+  applyPassManagerCLOptions(pm);
+
+  mlir::LowerToLLVMOptions lowerToLLVMOptions;
+
+  lowerToLLVMOptions.emitCWrappers = true;
+
+  if (emitAction >= Action::DumpMLIRLLVM) {
     pm.addPass(mlir::createLowerToCFGPass());
-    pm.addPass(mlir::createLowerToLLVMPass());
+    pm.addPass(mlir::createLowerToLLVMPass(lowerToLLVMOptions));
   }
 
   if (mlir::failed(pm.run(*newModule))) {
     llvm::errs() << "Failed conversion passes";
     return -1;
   }
-  newModule->print(llvm::outs());
+
+  if (emitAction <= DumpMLIRLLVM) {
+    newModule->print(llvm::outs());
+    return 0;
+  } else if (emitAction == DumpLLVMIR) {
+    return translateAndPrintLLVMIR(*module);
+  }
 
   return 0;
 }

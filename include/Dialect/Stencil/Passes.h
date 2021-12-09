@@ -1,7 +1,6 @@
 #ifndef DIALECT_STENCIL_PASSES_H
 #define DIALECT_STENCIL_PASSES_H
 
-
 #include "mlir/Pass/Pass.h"
 
 namespace mlir {
@@ -21,6 +20,8 @@ std::unique_ptr<OperationPass<FuncOp>> createShapeOverlapPass();
 std::unique_ptr<OperationPass<FuncOp>> createStorageMaterializationPass();
 
 std::unique_ptr<OperationPass<FuncOp>> createPeelOddIterationsPass();
+
+std::unique_ptr<OperationPass<ModuleOp>> createEraseNonStencilProgramsPass();
 
 //===----------------------------------------------------------------------===//
 // Registration

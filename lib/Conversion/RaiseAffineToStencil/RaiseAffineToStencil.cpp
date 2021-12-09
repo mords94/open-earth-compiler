@@ -4,6 +4,7 @@
 #include "Dialect/Stencil/StencilTypes.h"
 #include "Dialect/Stencil/StencilUtils.h"
 #include "PassDetail.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/SCF.h"
 #include "mlir/Dialect/StandardOps/IR/Ops.h"
 #include "mlir/IR/AffineMap.h"
@@ -68,43 +69,64 @@ bool hasApplyOp(mlir::Block &block) {
   return false;
 }
 
+Attribute getOffsetAttribute(mlir::Value operand, MLIRContext *context,
+                             size_t i) {
+
+  if (isDefinedByOperation<mlir::AddIOp>(operand)) {
+    auto addOp = operand.getDefiningOp<mlir::AddIOp>();
+
+    if (isDefinedByOperation<mlir::ConstantOp>(addOp.lhs()) &&
+        isDefinedByOperation<mlir::IndexCastOp>(addOp.rhs())) {
+      return IntegerAttr::get(IntegerType::get(context, 64),
+                              addOp.lhs()
+                                  .getDefiningOp<mlir::ConstantOp>()
+                                  .value()
+                                  .cast<IntegerAttr>()
+                                  .getInt());
+
+      // addOp.lhs().getDefiningOp()->erase();
+    }
+
+    if (isDefinedByOperation<mlir::IndexCastOp>(addOp.lhs()) &&
+        isDefinedByOperation<mlir::ConstantOp>(addOp.rhs())) {
+      return IntegerAttr::get(IntegerType::get(context, 64),
+                              addOp.rhs()
+                                  .getDefiningOp<mlir::ConstantOp>()
+                                  .value()
+                                  .cast<IntegerAttr>()
+                                  .getInt());
+      // addOp.rhs().getDefiningOp()->erase();
+    }
+
+    if (addOp->use_empty()) {
+      addOp.erase();
+    }
+  } else if (isDefinedByOperation<mlir::ConstantOp>(operand)) {
+    return IntegerAttr::get(IntegerType::get(context, 64),
+                            operand.getDefiningOp<mlir::ConstantOp>()
+                                .value()
+                                .cast<IntegerAttr>()
+                                .getInt());
+
+  } else if (isDefinedByOperation<mlir::IndexCastOp>(operand)) {
+    return getOffsetAttribute(operand.getDefiningOp<mlir::IndexCastOp>().in(),
+                              context, i);
+
+  } else {
+    llvm::errs() << "Unknown type of load operand\n";
+    operand.dump();
+
+    return nullptr;
+  }
+}
+
 SmallVector<Attribute> calculateOffsets(mlir::LoadOp loadOp) {
   SmallVector<Attribute> offsetAttr(loadOp.getIndices().size());
 
   for (size_t i = 0; i < loadOp.getIndices().size(); i++) {
     mlir::Value operand = loadOp.getIndices()[i];
     auto context = loadOp.getContext();
-
-    if (isDefinedByOperation<mlir::AddIOp>(operand)) {
-      auto addOp = operand.getDefiningOp<mlir::AddIOp>();
-
-      if (isDefinedByOperation<mlir::ConstantOp>(addOp.lhs()) &&
-          isDefinedByOperation<mlir::IndexCastOp>(addOp.rhs())) {
-        offsetAttr[i] = IntegerAttr::get(IntegerType::get(context, 64),
-                                         addOp.lhs()
-                                             .getDefiningOp<mlir::ConstantOp>()
-                                             .value()
-                                             .cast<IntegerAttr>()
-                                             .getInt());
-
-        addOp.lhs().getDefiningOp()->erase();
-      }
-
-      if (isDefinedByOperation<mlir::IndexCastOp>(addOp.lhs()) &&
-          isDefinedByOperation<mlir::ConstantOp>(addOp.rhs())) {
-        offsetAttr[i] = IntegerAttr::get(IntegerType::get(context, 64),
-                                         addOp.rhs()
-                                             .getDefiningOp<mlir::ConstantOp>()
-                                             .value()
-                                             .cast<IntegerAttr>()
-                                             .getInt());
-        addOp.rhs().getDefiningOp()->erase();
-      }
-
-      addOp.erase();
-    } else {
-      offsetAttr[i] = IntegerAttr::get(IntegerType::get(context, 64), 0);
-    }
+    offsetAttr[i] = getOffsetAttribute(operand, context, i);
   }
   return offsetAttr;
 }
@@ -319,17 +341,16 @@ class RaiseAffineToStencilPass
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<mlir::StandardOpsDialect>();
+    registry.insert<mlir::LLVM::LLVMDialect>();
     registry.insert<mlir::stencil::StencilDialect>();
   }
 
   void runOnOperation() override {
     auto module = getOperation();
 
-    for (auto attr : module.getAttrs()) {
-      module.removeAttr(attr.first.strref());
-    }
-
     module.walk([&](mlir::FuncOp funcOp) {
+      if (!funcOp.isPrivate()) {
+      }
       auto builder =
           OpBuilder::atBlockBegin(&funcOp.getBody().getBlocks().front());
 
@@ -364,6 +385,7 @@ class RaiseAffineToStencilPass
 
     target.addLegalDialect<StencilDialect>();
     target.addLegalDialect<mlir::StandardOpsDialect>();
+    target.addLegalDialect<mlir::LLVM::LLVMDialect>();
     target.addDynamicallyLegalOp<FuncOp>([](FuncOp funcOp) {
       for (auto &en : llvm::enumerate(funcOp.getType().getInputs())) {
         if (en.value().isa<MemRefType>()) {
@@ -383,12 +405,13 @@ class RaiseAffineToStencilPass
       signalPassFailure();
     }
 
-    module.walk([&frozenPatterns](FuncOp funcOp) {
+    module.walk([&](FuncOp funcOp) {
       (void)applyOpPatternsAndFold(funcOp, frozenPatterns);
     });
 
     // if (failed(applyPatternsAndFoldGreedily(module,
-    // std::move(rewritePatterns), 1))) {
+    // std::move(rewritePatterns),
+    //                                         1))) {
     //   signalPassFailure();
     // }
   }

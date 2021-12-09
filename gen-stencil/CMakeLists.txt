@@ -15,6 +15,7 @@ set(LIBS
   MLIRPass
   MLIRSideEffectInterfaces
   MLIRTransforms
+  MLIRTargetLLVMIR
   
   Stencil
   StencilToStandard

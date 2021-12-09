@@ -59,4 +59,9 @@ def PeelOddIterationsPass : FunctionPass<"stencil-peel-odd-iterations"> {
   let constructor = "mlir::createPeelOddIterationsPass()";
 }
 
+def EraseNonStencilProgramsPass : FunctionPass<"stencil-erase-non-stencil-programs"> {
+  let summary = "Removes any function that are not labeled as stencil.program";
+  let constructor = "mlir::createEraseNonStencilProgramsPass()";
+}
+
 #endif // DIALECT_STENCIL_PASSES
