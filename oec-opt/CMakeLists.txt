@@ -11,7 +11,7 @@ set(LIBS
   StencilToStandard
   RaiseAffineToStencil
   GPUToKernelAndRuntimeCalls
-  ${CUDA_RUNTIME_LIBRARY}
+  # ${CUDA_RUNTIME_LIBRARY}
 )
 
 add_llvm_executable(oec-opt oec-opt.cpp)

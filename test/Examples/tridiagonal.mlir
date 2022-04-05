@@ -7,9 +7,9 @@ module {
     %2 = stencil.cast %arg2([-4, -4, -4] : [68, 68, 68]) : (!stencil.field<?x?x?xf64>) -> !stencil.field<72x72x72xf64>
     %3 = stencil.load %0 : (!stencil.field<72x72x72xf64>) -> !stencil.temp<?x?x?xf64>
     %4 = stencil.load %1 : (!stencil.field<72x72x72xf64>) -> !stencil.temp<?x?x?xf64>
+    %c0 = constant 0 : index
     %5:2 = stencil.apply seq(dim = 2, range = 0 to 64, dir = 1) (%arg3 = %3 : !stencil.temp<?x?x?xf64>, %arg4 = %4 : !stencil.temp<?x?x?xf64>) -> (!stencil.temp<?x?x?xf64>, !stencil.temp<?x?x?xf64>) {
       %7 = stencil.index 2 [0, 0, 0] : index
-      %c0 = constant 0 : index
       %8 = cmpi "eq", %7, %c0 : index
       %cst = constant 3.000000e+00 : f64
       %cst_0 = constant -1.000000e+00 : f64

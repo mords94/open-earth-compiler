@@ -859,6 +859,21 @@ struct CastOpHoisting : public OpRewritePattern<stencil::CastOp> {
   }
 };
 
+struct CastOpCleaner : public OpRewritePattern<stencil::CastOp> {
+  using OpRewritePattern<stencil::CastOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(stencil::CastOp castOp,
+                                PatternRewriter &rewriter) const override {
+
+    if (castOp.use_empty()) {
+      rewriter.eraseOp(castOp);
+      return success();
+    }
+
+    return failure();
+  }
+};
+
 /// This is a pattern to hoist load ops out of the computation
 struct LoadOpHoisting : public OpRewritePattern<stencil::LoadOp> {
   using OpRewritePattern<stencil::LoadOp>::OpRewritePattern;
@@ -904,7 +919,7 @@ void stencil::CombineOp::getCanonicalizationPatterns(
 
 void stencil::CastOp::getCanonicalizationPatterns(
     OwningRewritePatternList &results, MLIRContext *context) {
-  results.insert<CastOpHoisting>(context);
+  results.insert<CastOpHoisting, CastOpCleaner>(context);
 }
 void stencil::LoadOp::getCanonicalizationPatterns(
     OwningRewritePatternList &results, MLIRContext *context) {

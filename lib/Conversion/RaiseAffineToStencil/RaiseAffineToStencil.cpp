@@ -208,11 +208,14 @@ public:
       return success();
     }
 
+    SmallVector<unsigned> argumentIndexesToDelete;
     for (auto &arg : funcOp.getArguments()) {
       if (arg.use_empty()) {
-        funcOp.eraseArgument(arg.getArgNumber());
+        argumentIndexesToDelete.push_back(arg.getArgNumber());
       }
     }
+
+    funcOp.eraseArguments(argumentIndexesToDelete);
 
     rewriter.setInsertionPointToStart(&entryBlock);
 
@@ -408,12 +411,6 @@ class RaiseAffineToStencilPass
     module.walk([&](FuncOp funcOp) {
       (void)applyOpPatternsAndFold(funcOp, frozenPatterns);
     });
-
-    // if (failed(applyPatternsAndFoldGreedily(module,
-    // std::move(rewritePatterns),
-    //                                         1))) {
-    //   signalPassFailure();
-    // }
   }
 };
 

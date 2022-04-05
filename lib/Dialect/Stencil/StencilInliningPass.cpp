@@ -67,6 +67,7 @@ struct StencilInliningPattern : public ApplyOpPattern {
               [](Operation *op) { return isa<stencil::DynAccessOp>(op); }))
         return false;
     }
+
     return true;
   }
 
@@ -368,7 +369,7 @@ void StencilInliningPass::runOnFunction() {
   });
   if (result.wasInterrupted())
     return signalPassFailure();
- 
+
   OwningRewritePatternList patterns;
   patterns.insert<InliningRewrite, RerouteRewrite>(&getContext());
   applyPatternsAndFoldGreedily(funcOp, std::move(patterns));

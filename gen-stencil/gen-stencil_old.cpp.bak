@@ -26,7 +26,6 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR.h"
 #include "mlir/Transforms/DialectConversion.h"
-// #include "mlir/Transforms/InliningUtils.h"
 #include "mlir/Transforms/Passes.h"
 #include "rapidjson/document.h"
 #include "rapidjson/stringbuffer.h"
@@ -43,10 +42,9 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <iostream>
-#include <string>
 
-#define OPS_READ 0
-#define OPS_WRITE 1
+#define OPS_READ "OPS_READ"
+#define OPS_WRITE "OPS_WRITE"
 
 using namespace mlir::stencil;
 using namespace mlir;
@@ -64,8 +62,8 @@ static cl::opt<std::string> jsonFileName(cl::Positional,
 
 static cl::opt<bool> enableOpt("opt", cl::desc("Enable optimizations"));
 
-static cl::opt<bool> enableInline("inline", cl::desc("Enable stencil inlining"),
-                                  cl::init(false));
+static cl::opt<bool> enableInline("inline",
+                                  cl::desc("Enable stencil inlining"));
 
 namespace {
 enum Action {
@@ -101,13 +99,6 @@ llvm::StringMap<mlir::FuncOp> functionMap;
 mlir::MLIRContext context;
 
 OpBuilder b(&context);
-
-template <typename... Args>
-std::string sstr(Args &&...args) {
-  std::ostringstream sstr;
-  (sstr << std::dec << ... << args);
-  return sstr.str();
-}
 
 mlir::OwningModuleRef createModule() {
   auto theModule = mlir::ModuleOp::create(b.getUnknownLoc());
@@ -164,6 +155,18 @@ mlir::Type getDataType(llvm::StringRef typeName, MLIRContext *context) {
   }
 }
 
+/**
+ * Creates an attribute of integere array
+ * @param size - size of the array
+ * @param value - initial value of the integer attr
+ **/
+ArrayAttr createI64ArrayAttr(int size, int value) {
+  SmallVector<mlir::Attribute> attr(
+      size, mlir::IntegerAttr::get(IntegerType::get(&context, 64), value));
+
+  return ArrayAttr::get(attr, &context);
+}
+
 ArrayAttr createI64ArrayAttr(SmallVector<int64_t> elements) {
   SmallVector<mlir::Attribute> attr;
 
@@ -189,23 +192,19 @@ SmallVector<int64_t> createI64VectorFromJsonArray(
 class KernelArgument {
 
 private:
-  std::string name;
+  llvm::StringRef name;
   mlir::Type type;
   mlir::stencil::FieldType fieldType;
   size_t idx;
   SmallVector<int64_t> begin;
   SmallVector<int64_t> end;
-  SmallVector<int64_t> size;
-  SmallVector<int64_t> base;
 
 public:
   llvm::StringRef getName() { return this->name; }
   mlir::Type getType() { return this->type; }
   mlir::stencil::FieldType getFieldType() { return this->fieldType; }
 
-  void setName(std::string name) { this->name = name; }
-  void setName(int64_t id) { setName(std::to_string(id)); }
-
+  void setName(llvm::StringRef name) { this->name = name; }
   void setType(mlir::Type type) { this->type = type; }
 
   void setId(size_t id) { this->idx = id; }
@@ -216,12 +215,6 @@ public:
 
   ArrayRef<int64_t> getEnd() { return this->end; }
   void setEnd(SmallVector<int64_t> end) { this->end = end; }
-
-  ArrayRef<int64_t> getBase() { return this->base; }
-  void setBase(SmallVector<int64_t> end) { this->base = end; }
-
-  ArrayRef<int64_t> getSize() { return this->size; }
-  void setSize(SmallVector<int64_t> end) { this->size = end; }
 
   void calculateFieldType() {
     assert(this->begin.size() > 1 && "begin size > 1");
@@ -236,38 +229,33 @@ public:
   int64_t getFullRange() { return this->end.front() - this->begin.front(); }
 
   ArrayAttr getBeginAttr(MLIRContext &context) {
-    SmallVector<mlir::Attribute> attr;
-
-    for (auto &en : llvm::enumerate(this->begin)) {
-      attr.push_back(
-          mlir::IntegerAttr::get(IntegerType::get(&context, 64), en.value()));
-    }
+    SmallVector<mlir::Attribute> attr(
+        this->begin.size(),
+        mlir::IntegerAttr::get(IntegerType::get(&context, 64),
+                               this->begin.front()));
 
     return ArrayAttr::get(attr, &context);
   }
 
   ArrayAttr getEndAttr(MLIRContext &context) {
-    SmallVector<mlir::Attribute> attr;
-
-    for (auto &en : llvm::enumerate(this->size)) {
-      attr.push_back(mlir::IntegerAttr::get(
-          IntegerType::get(&context, 64), en.value() - this->end[en.index()]));
-    }
+    SmallVector<mlir::Attribute> attr(
+        this->end.size(), mlir::IntegerAttr::get(IntegerType::get(&context, 64),
+                                                 this->end.front()));
 
     return ArrayAttr::get(attr, &context);
   }
 
-  mlir::stencil::FieldType getSizeFieldType() {
-    return mlir::stencil::FieldType::get(this->type, getSize());
-  }
-
   mlir::stencil::FieldType getFullRangeFieldType() {
-    return getSizeFieldType();
-    // SmallVector<int64_t> shape(this->begin.size(), getFullRange());
-    // return mlir::stencil::FieldType::get(this->type, shape);
+    SmallVector<int64_t> shape(this->begin.size(), getFullRange());
+    return mlir::stencil::FieldType::get(this->type, shape);
   }
 
   KernelArgument() {}
+  KernelArgument(llvm::StringRef name, mlir::Type type, size_t idx,
+                 SmallVector<int64_t> begin, SmallVector<int64_t> end)
+      : name(name), idx(idx), type(type), begin(begin), end(end) {
+    calculateFieldType();
+  }
 };
 
 class KernelApply {
@@ -287,7 +275,7 @@ public:
 
 llvm::StringMap<mlir::stencil::CastOp> castMap;
 llvm::StringMap<mlir::Value> loadedStencilsMap;
-std::vector<KernelArgument> arguments;
+SmallVector<KernelArgument> arguments;
 
 Document parseJson() {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> fileOrErr =
@@ -306,8 +294,8 @@ Document parseJson() {
   }
 
   assert(document.IsObject() && "Root is not an object");
-  assert(document.HasMember("dats") && "Root does not have datasets");
-  assert(document.HasMember("kernels") && "Root does not have loops");
+  assert(document.HasMember("datasets") && "Root does not have datasets");
+  assert(document.HasMember("loops") && "Root does not have loops");
 
   return document;
 }
@@ -326,14 +314,6 @@ Block *findMainBlock(OwningModuleRef &module) {
   return &funcOp.getBody().getBlocks().front();
 }
 
-void dumpLoadedStencilsMap() {
-  for (auto &en : llvm::enumerate(loadedStencilsMap)) {
-    llvm::errs() << " [arg: " + en.value().getKey() + " ]\n";
-    en.value().getValue().dump();
-    llvm::errs() << " [\\arg]\n";
-  }
-}
-
 mlir::CallOp lookupAndCallApplyKernel(llvm::StringRef name,
                                       SmallVector<mlir::Value> readArgs,
                                       OwningModuleRef &module,
@@ -343,6 +323,7 @@ mlir::CallOp lookupAndCallApplyKernel(llvm::StringRef name,
   auto builder = OpBuilder::atBlockTerminator(mainBlock);
 
   auto kernelsFunctions = kernelsModule->getBody()->getOps<mlir::FuncOp>();
+
   mlir::FuncOp kernelToCall = nullptr;
   for (auto kf : kernelsFunctions) {
     if (kf.getName().contains(name)) {
@@ -351,29 +332,12 @@ mlir::CallOp lookupAndCallApplyKernel(llvm::StringRef name,
     }
   }
 
-  if (kernelToCall == nullptr) {
-    llvm::errs() << "Kernel: " << name << "\n";
-    assert(kernelToCall != nullptr && "Kernel not found.");
-  }
+  assert(kernelToCall != nullptr && "Kernel not found.");
 
-  for (auto &ra : readArgs) {
-    assert(ra != nullptr && "One of the input argumemt is null");
-  }
+  llvm::SmallVector<mlir::Value> args;
 
   auto callOp = builder.create<mlir::CallOp>(module->getLoc(), kernelToCall,
                                              ValueRange(readArgs));
-
-  /* inline kernel calls */
-  // mlir::stencil::StencilDialect::getRegisteredInterface(
-  //     TypeID::get<mlir::stencil::StencilDialect>());
-
-  // mlir::inlineCall(StencilInlinerInterface);
-
-  auto applyOp = builder.create<stencil::ApplyOp>(
-      module->getLoc(), kernelToCall.getType().getResults(),
-      ValueRange(readArgs), llvm::None, llvm::None);
-
-  callOp->setAttr(std::string("inlineable"), builder.getBoolAttr(true));
 
   return callOp;
 }
@@ -383,8 +347,8 @@ int processDatasets(Document &document, MLIRContext &context,
 
   auto root = document.GetObject();
 
-  const rapidjson::Value &datasets = document["dats"];
-  assert(datasets.IsArray() && "Dats is not an array");
+  const rapidjson::Value &datasets = document["datasets"];
+  assert(datasets.IsArray() && "Datasets is not an array");
 
   llvm::SmallVector<mlir::Type> argTypes;
 
@@ -392,16 +356,12 @@ int processDatasets(Document &document, MLIRContext &context,
 
     KernelArgument kernelArgument;
     kernelArgument.setId(d["idx"].GetInt64());
-    // kernelArgument.setName(d["name"].GetString());
-    kernelArgument.setName(d["idx"].GetInt64());
+    kernelArgument.setName(d["name"].GetString());
     kernelArgument.setType(getDataType(d["type"].GetString(), &context));
 
-    kernelArgument.setBegin(createI64VectorFromJsonArray(d["d_m"].GetArray()));
-
-    kernelArgument.setEnd(createI64VectorFromJsonArray(d["d_p"].GetArray()));
-    kernelArgument.setBase(createI64VectorFromJsonArray(d["base"].GetArray()));
-    kernelArgument.setSize(createI64VectorFromJsonArray(d["size"].GetArray()));
-
+    kernelArgument.setBegin(
+        createI64VectorFromJsonArray(d["begin"].GetArray()));
+    kernelArgument.setEnd(createI64VectorFromJsonArray(d["end"].GetArray()));
     kernelArgument.calculateFieldType();
 
     arguments.push_back(kernelArgument);
@@ -456,12 +416,12 @@ int processLoops(Document &document, MLIRContext &context,
 
   auto root = document.GetObject();
 
-  const rapidjson::Value &kernels = document["kernels"];
-  assert(kernels.IsArray() && "Kernels is not an array");
+  const rapidjson::Value &loops = document["loops"];
+  assert(loops.IsArray() && "Loops is not an array");
 
   llvm::StringMap<mlir::stencil::StoreOp> storeMap;
 
-  for (auto &l : kernels.GetArray()) {
+  for (auto &l : loops.GetArray()) {
     assert(l["name"].IsString() && "Name is not a string");
     llvm::StringRef name = l["name"].GetString();
 
@@ -470,14 +430,11 @@ int processLoops(Document &document, MLIRContext &context,
     SmallVector<llvm::StringRef> writeArgNames;
     SmallVector<llvm::StringRef> readArgNames;
 
-    assert(l.HasMember("args") && "no args");
-    assert(l["args"].IsArray() && "args is not an array");
-
     for (auto &arg : l["args"].GetArray()) {
-      llvm::StringRef argName = std::to_string(arg["datidx"].GetInt64());
-      int64_t acc = arg["acc"].GetInt64();
+      llvm::StringRef argName = arg["name"].GetString();
+      llvm::StringRef acc = arg["acc"].GetString();
 
-      if (acc == OPS_READ) {
+      if (llvm::StringRef(acc).equals(OPS_READ)) {
         readArgs.push_back(loadedStencilsMap[argName]);
         readArgNames.push_back(argName);
       } else {
@@ -486,29 +443,23 @@ int processLoops(Document &document, MLIRContext &context,
       }
     }
 
+    // TODO: Figure out unused
+    // for (auto &argName : readArgNames) {
+    //   if (storeMap.count(argName) == 1) {
+    //     storeMap[argName].erase();
+    //   }
+    // }
+
     auto callOp =
         lookupAndCallApplyKernel(name, readArgs, module, kernelsModule);
 
     auto mainBlock = findMainBlock(module);
-
     auto builder = OpBuilder::atBlockTerminator(mainBlock);
 
-    assert(l.HasMember("range") && "no ragen");
-    auto range = createI64VectorFromJsonArray(l["range"].GetArray());
-
-    SmallVector<int64_t> beginValues;
-    SmallVector<int64_t> endValues;
-
-    for (auto &en : llvm::enumerate(range)) {
-      if (en.index() % 2 == 0) {
-        beginValues.push_back(en.value());
-      } else {
-        endValues.push_back(en.value());
-      }
-    }
-
-    auto begin = createI64ArrayAttr(beginValues);
-    auto end = createI64ArrayAttr(endValues);
+    auto begin =
+        createI64ArrayAttr(createI64VectorFromJsonArray(l["begin"].GetArray()));
+    auto end =
+        createI64ArrayAttr(createI64VectorFromJsonArray(l["end"].GetArray()));
 
     for (auto &argName : writeArgNames) {
       auto storeOp = builder.create<stencil::StoreOp>(
@@ -566,7 +517,6 @@ int main(int argc, char **argv) {
 
   Document document = parseJson();
   processDatasets(document, context, newModule);
-  // newModule->dump();
 
   for (auto kernel : module->getBody()->getOps<mlir::FuncOp>()) {
     auto clonedKernel = kernel.clone();
@@ -574,32 +524,23 @@ int main(int argc, char **argv) {
     newModule->push_back(clonedKernel);
   }
 
-  // dumpLoadedStencilsMap();
-
   processLoops(document, context, newModule, module);
 
-  // remove stores for intermediary stencils results
-  newModule->walk([](mlir::stencil::StoreOp storeOp) {
-    // if apply op result only used by the store op
-    if (!storeOp.getOperand(0).hasOneUse()) {
-      storeOp.erase();
-    }
-  });
-
-  return 0;
-  newModule->dump();
+  // newModule->walk([](mlir::stencil::StoreOp storeOp) {
+  //   if (!storeOp.getOperand(0).hasOneUse()) {
+  //     storeOp.erase();
+  //   }
+  // });
 
   mlir::PassManager pm(&context);
 
-  // newModule->dump();
+  llvm::errs() << "emitAction = " << emitAction << "\n";
 
   pm.addPass(mlir::createInlinerPass());
   pm.addPass(mlir::createEraseNonStencilProgramsPass());
 
   if (enableInline) {
     pm.addNestedPass<mlir::FuncOp>(mlir::createStencilInliningPass());
-    pm.addPass(mlir::createCSEPass());
-    pm.addPass(mlir::createCanonicalizerPass());
   }
 
   if (emitAction >= Action::DumpStencilShapes) {
@@ -611,9 +552,10 @@ int main(int argc, char **argv) {
     pm.addPass(mlir::createCSEPass());
     pm.addPass(mlir::createCanonicalizerPass());
     pm.addPass(mlir::createLowerAffinePass());
-    pm.addPass(mlir::createCSEPass());
     pm.addPass(mlir::createCanonicalizerPass());
   }
+
+  applyPassManagerCLOptions(pm);
 
   mlir::LowerToLLVMOptions lowerToLLVMOptions;
 
@@ -623,8 +565,6 @@ int main(int argc, char **argv) {
     pm.addPass(mlir::createLowerToCFGPass());
     pm.addPass(mlir::createLowerToLLVMPass(lowerToLLVMOptions));
   }
-
-  applyPassManagerCLOptions(pm);
 
   if (mlir::failed(pm.run(*newModule))) {
     llvm::errs() << "Failed conversion passes";
