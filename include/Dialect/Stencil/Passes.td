@@ -64,4 +64,9 @@ def EraseNonStencilProgramsPass : FunctionPass<"stencil-erase-non-stencil-progra
   let constructor = "mlir::createEraseNonStencilProgramsPass()";
 }
 
+def EraseStencilBuffersPass : FunctionPass<"stencil-erase-buffers"> {
+  let summary = "Removes stencil buffers";
+  let constructor = "mlir::createEraseStencilBuffersPass()";
+}
+
 #endif // DIALECT_STENCIL_PASSES

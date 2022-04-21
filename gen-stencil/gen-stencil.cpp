@@ -64,6 +64,9 @@ static cl::opt<std::string> jsonFileName(cl::Positional,
 
 static cl::opt<bool> enableOpt("opt", cl::desc("Enable optimizations"));
 
+static cl::opt<bool> enableAttrs("print-attr", cl::desc("Enable name attrs"),
+                                 cl::init(false));
+
 static cl::opt<bool> enableInline("inline", cl::desc("Enable stencil inlining"),
                                   cl::init(false));
 
@@ -97,6 +100,7 @@ static cl::opt<enum Action> emitAction(
                    "JIT the code and run it by invoking the main function")));
 
 llvm::StringMap<mlir::FuncOp> functionMap;
+llvm::StringMap<bool> accMap;
 
 mlir::MLIRContext context;
 
@@ -189,6 +193,7 @@ SmallVector<int64_t> createI64VectorFromJsonArray(
 class KernelArgument {
 
 private:
+  std::string readableName;
   std::string name;
   mlir::Type type;
   mlir::stencil::FieldType fieldType;
@@ -199,6 +204,9 @@ private:
   SmallVector<int64_t> base;
 
 public:
+  llvm::StringRef getReadableName() { return this->readableName; }
+  void setReadableName(std::string name) { this->readableName = name; }
+
   llvm::StringRef getName() { return this->name; }
   mlir::Type getType() { return this->type; }
   mlir::stencil::FieldType getFieldType() { return this->fieldType; }
@@ -288,6 +296,7 @@ public:
 llvm::StringMap<mlir::stencil::CastOp> castMap;
 llvm::StringMap<mlir::Value> loadedStencilsMap;
 std::vector<KernelArgument> arguments;
+llvm::StringMap<std::string> argumentNameMap;
 
 Document parseJson() {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> fileOrErr =
@@ -312,18 +321,27 @@ Document parseJson() {
   return document;
 }
 
+mlir::FuncOp getMainFunc(OwningModuleRef &module) {
+  return *(module->getBodyRegion()
+               .getBlocks()
+               .front()
+               .getOps<mlir::FuncOp>()
+               .begin());
+}
+
 /**
  * Finds the the first block in the
  * first function of the module
  **/
 Block *findMainBlock(OwningModuleRef &module) {
-  mlir::FuncOp funcOp = *(module->getBodyRegion()
-                              .getBlocks()
-                              .front()
-                              .getOps<mlir::FuncOp>()
-                              .begin());
+  mlir::FuncOp funcOp = getMainFunc(module);
 
   return &funcOp.getBody().getBlocks().front();
+}
+
+mlir::OpBuilder mainBuilder(OwningModuleRef &module) {
+  auto mainBlock = findMainBlock(module);
+  return OpBuilder::atBlockTerminator(mainBlock);
 }
 
 void dumpLoadedStencilsMap() {
@@ -334,13 +352,61 @@ void dumpLoadedStencilsMap() {
   }
 }
 
-mlir::CallOp lookupAndCallApplyKernel(llvm::StringRef name,
-                                      SmallVector<mlir::Value> readArgs,
-                                      OwningModuleRef &module,
-                                      OwningModuleRef &kernelsModule) {
+mlir::stencil::ApplyOp createCopyKernel(mlir::Value from, mlir::Value to,
+                                        mlir::ArrayAttr lb, mlir::ArrayAttr ub,
+                                        llvm::StringRef toName,
+                                        OwningModuleRef &module) {
 
-  auto mainBlock = findMainBlock(module);
-  auto builder = OpBuilder::atBlockTerminator(mainBlock);
+  auto builder = mainBuilder(module);
+
+  auto resultTempType = to.getType().cast<stencil::FieldType>();
+
+  SmallVector<int64_t> unrankedShape(resultTempType.getShape().size(), -1);
+
+  auto unrankedResultTempType =
+      stencil::TempType::get(resultTempType.getElementType(), unrankedShape);
+
+  auto applyOp = builder.create<stencil::ApplyOp>(
+      module->getLoc(), unrankedResultTempType, from, llvm::None, llvm::None);
+
+  if (enableAttrs) {
+    applyOp->setAttr(std::string("name"),
+                     builder.getStringAttr(std::string("copy_kernel")));
+  }
+
+  builder.setInsertionPointToStart(applyOp.getBody());
+
+  llvm::SmallVector<int64_t, 3> tempShape(from.getDefiningOp()
+                                              ->getResult(0)
+                                              .getType()
+                                              .cast<stencil::TempType>()
+                                              .getMemRefShape()
+                                              .size(),
+                                          0);
+
+  auto accessOp = builder.create<stencil::AccessOp>(
+      module->getLoc(), applyOp.getBody()->getArgument(0), tempShape);
+
+  auto stencilStoreOp = builder.create<stencil::StoreResultOp>(
+      module->getLoc(), accessOp.getResult());
+
+  builder.create<stencil::ReturnOp>(applyOp.getLoc(), llvm::None,
+                                    stencilStoreOp.getResult());
+
+  builder.setInsertionPointAfter(applyOp);
+  auto storeOp = builder.create<stencil::StoreOp>(
+      module->getLoc(), applyOp->getResult(0), to, lb, ub);
+  if (enableAttrs) {
+    storeOp->setAttr(std::string("from"), builder.getStringAttr("copy_kernel"));
+    storeOp->setAttr(std::string("to"), builder.getStringAttr(toName));
+  }
+}
+
+mlir::stencil::ApplyOp lookupAndCallApplyKernel(
+    llvm::StringRef name, SmallVector<mlir::Value> readArgs,
+    OwningModuleRef &module, OwningModuleRef &kernelsModule) {
+
+  auto builder = mainBuilder(module);
 
   auto kernelsFunctions = kernelsModule->getBody()->getOps<mlir::FuncOp>();
   mlir::FuncOp kernelToCall = nullptr;
@@ -357,25 +423,34 @@ mlir::CallOp lookupAndCallApplyKernel(llvm::StringRef name,
   }
 
   for (auto &ra : readArgs) {
-    assert(ra != nullptr && "One of the input argumemt is null");
+    assert(ra != nullptr && "One of the input argument is null");
   }
 
-  auto callOp = builder.create<mlir::CallOp>(module->getLoc(), kernelToCall,
-                                             ValueRange(readArgs));
+  /*
+    inline apply op from kernel function
+    assuming that it contains only an apply op
+  */
+  SmallVector<mlir::stencil::ApplyOp, 2> applyOps(
+      kernelToCall.getBody()
+          .getBlocks()
+          .front()
+          .getOps<mlir::stencil::ApplyOp>());
 
-  /* inline kernel calls */
-  // mlir::stencil::StencilDialect::getRegisteredInterface(
-  //     TypeID::get<mlir::stencil::StencilDialect>());
+  mlir::stencil::ApplyOp *applyOp = applyOps.begin();
 
-  // mlir::inlineCall(StencilInlinerInterface);
+  mlir::Operation *clonedOp = builder.clone(*applyOp->getOperation());
+  if (enableAttrs) {
+    clonedOp->setAttr(std::string("name"), builder.getStringAttr(name));
+  }
+  clonedOp->setLoc(OpaqueLoc::get<void *>(nullptr, module->getLoc()));
 
-  auto applyOp = builder.create<stencil::ApplyOp>(
-      module->getLoc(), kernelToCall.getType().getResults(),
-      ValueRange(readArgs), llvm::None, llvm::None);
+  assert(
+      kernelToCall.getNumArguments() ==
+          cast<mlir::stencil::ApplyOp>(clonedOp).getBody()->getNumArguments() &&
+      "Invalid number of operands");
+  clonedOp->setOperands(ValueRange(readArgs));
 
-  callOp->setAttr(std::string("inlineable"), builder.getBoolAttr(true));
-
-  return callOp;
+  return cast<mlir::stencil::ApplyOp>(clonedOp);
 }
 
 int processDatasets(Document &document, MLIRContext &context,
@@ -389,10 +464,9 @@ int processDatasets(Document &document, MLIRContext &context,
   llvm::SmallVector<mlir::Type> argTypes;
 
   for (auto &d : datasets.GetArray()) {
-
     KernelArgument kernelArgument;
     kernelArgument.setId(d["idx"].GetInt64());
-    // kernelArgument.setName(d["name"].GetString());
+    kernelArgument.setReadableName(d["name"].GetString());
     kernelArgument.setName(d["idx"].GetInt64());
     kernelArgument.setType(getDataType(d["type"].GetString(), &context));
 
@@ -407,6 +481,9 @@ int processDatasets(Document &document, MLIRContext &context,
     arguments.push_back(kernelArgument);
 
     argTypes.push_back(kernelArgument.getFieldType());
+
+    argumentNameMap[kernelArgument.getName()] =
+        kernelArgument.getReadableName().str();
   }
 
   auto builder = OpBuilder::atBlockBegin(
@@ -416,7 +493,6 @@ int processDatasets(Document &document, MLIRContext &context,
 
   auto funcOp = builder.create<mlir::FuncOp>(module.get().getLoc(), "jit",
                                              funcType, llvm::None);
-
   funcOp->setAttr(mlir::stencil::StencilDialect::getStencilProgramAttrName(),
                   builder.getBoolAttr(true));
 
@@ -429,6 +505,11 @@ int processDatasets(Document &document, MLIRContext &context,
         funcOp.getLoc(), en.value().getFullRangeFieldType(),
         funcOp.getArgument(en.index()), en.value().getBeginAttr(context),
         en.value().getEndAttr(context));
+
+    if (enableAttrs) {
+      castOp->setAttr(std::string("name"),
+                      builder.getStringAttr(en.value().getReadableName()));
+    }
 
     auto resultTempType =
         castOp.getResult().getType().cast<stencil::FieldType>();
@@ -493,7 +574,7 @@ int processLoops(Document &document, MLIRContext &context,
 
     auto builder = OpBuilder::atBlockTerminator(mainBlock);
 
-    assert(l.HasMember("range") && "no ragen");
+    assert(l.HasMember("range") && "no range on kernel");
     auto range = createI64VectorFromJsonArray(l["range"].GetArray());
 
     SmallVector<int64_t> beginValues;
@@ -510,12 +591,25 @@ int processLoops(Document &document, MLIRContext &context,
     auto begin = createI64ArrayAttr(beginValues);
     auto end = createI64ArrayAttr(endValues);
 
-    for (auto &argName : writeArgNames) {
+    for (auto &en : llvm::enumerate(writeArgNames)) {
+      auto argName = en.value();
+      auto index = en.index();
       auto storeOp = builder.create<stencil::StoreOp>(
-          callOp.getLoc(), callOp.getResult(0), castMap[argName], begin, end);
+          callOp->getLoc(), callOp->getResult(index), castMap[argName], begin,
+          end);
+
+      if (enableAttrs) {
+        storeOp->setAttr(
+            std::string("from"),
+            builder.getStringAttr(
+                callOp->getAttr("name").cast<mlir::StringAttr>().getValue()));
+
+        storeOp->setAttr(std::string("to"),
+                         builder.getStringAttr(argumentNameMap[argName]));
+      }
 
       storeMap[argName] = storeOp;
-      loadedStencilsMap[argName] = callOp.getResult(0);
+      loadedStencilsMap[argName] = callOp->getResult(index);
     }
   }
 
@@ -566,35 +660,111 @@ int main(int argc, char **argv) {
 
   Document document = parseJson();
   processDatasets(document, context, newModule);
-  // newModule->dump();
 
+  // add kernels to the new module
   for (auto kernel : module->getBody()->getOps<mlir::FuncOp>()) {
     auto clonedKernel = kernel.clone();
-    // clonedKernel.setPrivate();
     newModule->push_back(clonedKernel);
   }
 
-  // dumpLoadedStencilsMap();
-
   processLoops(document, context, newModule, module);
-
-  // remove stores for intermediary stencils results
-  newModule->walk([](mlir::stencil::StoreOp storeOp) {
-    // if apply op result only used by the store op
-    if (!storeOp.getOperand(0).hasOneUse()) {
-      storeOp.erase();
-    }
-  });
-
-  return 0;
-  newModule->dump();
 
   mlir::PassManager pm(&context);
 
-  // newModule->dump();
+  // erase non-main functions
+  mlir::PassManager pmTidy(&context);
+  pmTidy.addPass(mlir::createEraseNonStencilProgramsPass());
+  pmTidy.addPass(mlir::createCanonicalizerPass());
+  if (mlir::failed(pmTidy.run(*newModule))) {
+    llvm::errs() << "Failed to run clean up passes";
+    return -1;
+  }
 
-  pm.addPass(mlir::createInlinerPass());
-  pm.addPass(mlir::createEraseNonStencilProgramsPass());
+  // remove unnsecessary stores for intermediary stencils results
+  if (enableInline) {
+    newModule->walk([&](mlir::stencil::StoreOp storeOp) {
+      if (!storeOp.temp().hasOneUse()) {
+        storeOp.erase();
+      }
+    });
+  }
+
+  newModule->walk([&](mlir::stencil::StoreOp storeOp) {
+    // storeOp.dump();
+    bool isStoreOverlappingInput =
+        llvm::any_of(storeOp.field().getUses(), [&](mlir::OpOperand &op) {
+          return isa<mlir::stencil::LoadOp>(op.getOwner());
+        });
+
+    if (isStoreOverlappingInput && enableInline) {
+      auto builder = mainBuilder(newModule);
+      auto originalCastOp = storeOp.field().getDefiningOp();
+
+      auto funcOp = getMainFunc(newModule);
+
+      bool found = false;
+      for (auto &en : llvm::enumerate(funcOp.getArguments())) {
+        auto arg = en.value();
+        auto argIndex = en.index();
+
+        if (arg.use_empty()) {
+
+          auto castOp = builder.clone(*originalCastOp);
+
+          castOp->setOperand(0, arg);
+          auto toName = argumentNameMap[std::to_string(argIndex)];
+
+          if (enableAttrs) {
+            castOp->setAttr(std::string("name"), builder.getStringAttr(toName));
+          }
+
+          auto bufferOp = builder.create<mlir::stencil::BufferOp>(
+              newModule->getLoc(), storeOp.temp());
+          createCopyKernel(bufferOp.getResult(), castOp->getResult(0),
+                           storeOp.lbAttr(), storeOp.ubAttr(), toName,
+                           newModule);
+
+          found = true;
+          break;
+        }
+      }
+
+      if (!found) {
+        storeOp.emitError(
+            "There are no unused arguments for creating copy kernel");
+        mlir::failure(true);
+      } else {
+        storeOp.erase();
+      }
+    }
+  });
+
+  // erase func unused arguments from main func
+  SmallVector<unsigned> argumentIndexesToDelete;
+  mlir::FuncOp funcOp = getMainFunc(newModule);
+
+  for (auto &arg : funcOp.getArguments()) {
+    if (arg.use_empty()) {
+      argumentIndexesToDelete.push_back(arg.getArgNumber());
+    }
+  }
+
+  funcOp.eraseArguments(argumentIndexesToDelete);
+
+  // verify all applyOps has store op
+  newModule->walk([&](mlir::stencil::ApplyOp applyOp) {
+    auto hasUnusedResult = false;
+    for (auto res : applyOp.getResults()) {
+      if (res.use_empty()) {
+        hasUnusedResult = true;
+        break;
+      }
+    }
+
+    if (hasUnusedResult) {
+      applyOp.emitOpError("expected to have usage");
+    }
+  });
 
   if (enableInline) {
     pm.addNestedPass<mlir::FuncOp>(mlir::createStencilInliningPass());
@@ -604,6 +774,8 @@ int main(int argc, char **argv) {
 
   if (emitAction >= Action::DumpStencilShapes) {
     pm.addNestedPass<mlir::FuncOp>(mlir::createShapeInferencePass());
+    pm.addPass(mlir::createCSEPass());
+    pm.addPass(mlir::createCanonicalizerPass());
   }
 
   if (emitAction >= Action::DumpStandard) {

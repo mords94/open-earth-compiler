@@ -45,7 +45,7 @@ void registerTestGpuParallelLoopMappingPass();
 
 int main(int argc, char **argv) {
   registerAllPasses();
-  // test::registerTestGpuParallelLoopMappingPass();
+  test::registerTestGpuParallelLoopMappingPass();
 
   // Register the stencil passes
   registerStencilPasses();
@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
 
   // Register the stencil pipelines
 #ifdef CUDA_BACKEND_ENABLED
-  // registerGPUToCUBINPipeline();
+  registerGPUToCUBINPipeline();
 #endif
 #ifdef ROCM_BACKEND_ENABLED
   // registerGPUToHSACOPipeline();

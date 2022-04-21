@@ -23,6 +23,8 @@ std::unique_ptr<OperationPass<FuncOp>> createPeelOddIterationsPass();
 
 std::unique_ptr<OperationPass<ModuleOp>> createEraseNonStencilProgramsPass();
 
+std::unique_ptr<OperationPass<FuncOp>> createEraseStencilBuffersPass();
+
 //===----------------------------------------------------------------------===//
 // Registration
 //===----------------------------------------------------------------------===//
