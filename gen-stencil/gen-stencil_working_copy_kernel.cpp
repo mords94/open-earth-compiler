@@ -43,7 +43,6 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <iostream>
-#include <regex>
 #include <string>
 
 #define OPS_READ 0
@@ -71,9 +70,6 @@ static cl::opt<bool> enableAttrs("print-attr", cl::desc("Enable name attrs"),
 static cl::opt<bool> enableInline("inline", cl::desc("Enable stencil inlining"),
                                   cl::init(false));
 
-static cl::opt<bool> enableDebug("enable-debug", cl::desc("Enable debug"),
-                                 cl::init(false));
-
 static cl::opt<bool>
     enableEraseArgs("erase-args", cl::desc("Enable removing unused arguments"),
                     cl::init(false));
@@ -88,18 +84,7 @@ enum Action {
   DumpLLVMIR,
   RunJIT
 };
-
-enum OverlappingInlineStrategy {
-  StrategyOverwrite,
-  StrategyBuffer,
-};
-
-enum Target {
-  CPU,
-  CUBIN,
-};
-} // namespace
-
+}
 static cl::opt<enum Action> emitAction(
     "emit", cl::init(DumpStencil),
     cl::desc("Select the kind of output desired"),
@@ -117,20 +102,6 @@ static cl::opt<enum Action> emitAction(
     cl::values(
         clEnumValN(RunJIT, "jit",
                    "JIT the code and run it by invoking the main function")));
-
-static cl::opt<enum OverlappingInlineStrategy> overlappingInlineStrategy(
-    "inline-strategy", cl::init(StrategyOverwrite),
-    cl::desc("Select the kind of output desired"),
-    cl::values(clEnumValN(StrategyBuffer, "buffer",
-                          "Redirects output from overlapping kernels to a "
-                          "unused argument if exists any")),
-    cl::values(clEnumValN(StrategyOverwrite, "overwrite",
-                          "Inserts buffer op")));
-
-static cl::opt<enum Target>
-    target("target", cl::init(CPU), cl::desc("Select the target"),
-           cl::values(clEnumValN(CPU, "cpu", "Single thread cpu target")),
-           cl::values(clEnumValN(CUBIN, "cubin", "Cuda target")));
 
 llvm::StringMap<mlir::FuncOp> functionMap;
 llvm::StringMap<bool> accMap;
@@ -311,29 +282,6 @@ public:
   KernelArgument() {}
 };
 
-class StoreTemp {
-private:
-  mlir::Value temp;
-  mlir::Value field;
-  mlir::ArrayAttr lb;
-  mlir::ArrayAttr ub;
-
-public:
-  mlir::Value getTemp() { return this->temp; }
-  void setTemp(mlir::Value temp) { this->temp = temp; }
-
-  mlir::Value getField() { return this->field; }
-  void setField(mlir::Value field) { this->field = field; }
-
-  mlir::ArrayAttr getLb() { return this->lb; }
-  void setLb(mlir::ArrayAttr lb) { this->lb = lb; }
-
-  mlir::ArrayAttr getUb() { return this->ub; }
-  void setUb(mlir::ArrayAttr ub) { this->ub = ub; }
-
-  StoreTemp() {}
-};
-
 class KernelApply {
 
 private:
@@ -400,36 +348,12 @@ mlir::OpBuilder mainBuilder(OwningModuleRef &module) {
   return OpBuilder::atBlockTerminator(mainBlock);
 }
 
-mlir::OpBuilder mainBuilderFront(OwningModuleRef &module) {
-  auto mainBlock = findMainBlock(module);
-  return OpBuilder::atBlockBegin(mainBlock);
-}
-
 void dumpLoadedStencilsMap() {
   for (auto &en : llvm::enumerate(loadedStencilsMap)) {
     llvm::errs() << " [arg: " + en.value().getKey() + " ]\n";
     en.value().getValue().dump();
     llvm::errs() << " [\\arg]\n";
   }
-}
-
-mlir::WalkResult verifyStorages(OwningModuleRef &module) {
-  return module->walk([&](mlir::stencil::ApplyOp applyOp) {
-    auto hasUnusedResult = false;
-    for (auto res : applyOp.getResults()) {
-      if (res.use_empty()) {
-        hasUnusedResult = true;
-        break;
-      }
-    }
-
-    if (hasUnusedResult) {
-      applyOp.emitOpError("expected to have usage (storage)");
-      return WalkResult::interrupt();
-    }
-
-    return WalkResult::advance();
-  });
 }
 
 mlir::stencil::ApplyOp createCopyKernel(mlir::Value from, mlir::Value to,
@@ -484,8 +408,7 @@ mlir::stencil::ApplyOp createCopyKernel(mlir::Value from, mlir::Value to,
 
 mlir::stencil::ApplyOp lookupAndCallApplyKernel(
     llvm::StringRef name, SmallVector<mlir::Value> readArgs,
-    SmallVector<std::string> readArgNames, OwningModuleRef &module,
-    OwningModuleRef &kernelsModule) {
+    OwningModuleRef &module, OwningModuleRef &kernelsModule) {
 
   auto builder = mainBuilder(module);
 
@@ -503,12 +426,8 @@ mlir::stencil::ApplyOp lookupAndCallApplyKernel(
     assert(kernelToCall != nullptr && "Kernel not found.");
   }
 
-  for (auto &ra : llvm::enumerate(readArgs)) {
-    if (ra.value() == nullptr) {
-      llvm::errs() << "Kernel: " << name << "\n";
-      llvm::errs() << "Arg index null: " << readArgNames[ra.index()] << "\n";
-    }
-    assert(ra.value() != nullptr && "One of the input argument is null");
+  for (auto &ra : readArgs) {
+    assert(ra != nullptr && "One of the input argument is null");
   }
 
   /*
@@ -533,7 +452,6 @@ mlir::stencil::ApplyOp lookupAndCallApplyKernel(
       kernelToCall.getNumArguments() ==
           cast<mlir::stencil::ApplyOp>(clonedOp).getBody()->getNumArguments() &&
       "Invalid number of operands");
-
   clonedOp->setOperands(ValueRange(readArgs));
 
   return cast<mlir::stencil::ApplyOp>(clonedOp);
@@ -634,14 +552,14 @@ int processLoops(Document &document, MLIRContext &context,
 
     SmallVector<mlir::Value> readArgs;
     SmallVector<mlir::Value> writeArgs;
-    SmallVector<std::string> writeArgNames;
-    SmallVector<std::string> readArgNames;
+    SmallVector<llvm::StringRef> writeArgNames;
+    SmallVector<llvm::StringRef> readArgNames;
 
     assert(l.HasMember("args") && "no args");
     assert(l["args"].IsArray() && "args is not an array");
 
     for (auto &arg : l["args"].GetArray()) {
-      auto argName = std::to_string(arg["datidx"].GetInt64());
+      llvm::StringRef argName = std::to_string(arg["datidx"].GetInt64());
       int64_t acc = arg["acc"].GetInt64();
 
       if (acc == OPS_READ) {
@@ -649,12 +567,12 @@ int processLoops(Document &document, MLIRContext &context,
         readArgNames.push_back(argName);
       } else {
         writeArgNames.push_back(argName);
-        writeArgs.push_back(castMap[argName]);
+        writeArgs.push_back(loadedStencilsMap[argName]);
       }
     }
 
-    auto callOp = lookupAndCallApplyKernel(name, readArgs, readArgNames, module,
-                                           kernelsModule);
+    auto callOp =
+        lookupAndCallApplyKernel(name, readArgs, module, kernelsModule);
 
     auto mainBlock = findMainBlock(module);
 
@@ -678,15 +596,11 @@ int processLoops(Document &document, MLIRContext &context,
     auto end = createI64ArrayAttr(endValues);
 
     for (auto &en : llvm::enumerate(writeArgNames)) {
-      // workaround for strange cases when the argName string contains a null
-      // terminator
-      std::regex re("\\0");
-      auto writeArgName = std::regex_replace(en.value(), re, "$1");
+      auto argName = en.value();
       auto index = en.index();
-
       auto storeOp = builder.create<stencil::StoreOp>(
-          callOp->getLoc(), callOp->getResult(index), castMap[writeArgName],
-          begin, end);
+          callOp->getLoc(), callOp->getResult(index), castMap[argName], begin,
+          end);
 
       if (enableAttrs) {
         storeOp->setAttr(
@@ -695,11 +609,11 @@ int processLoops(Document &document, MLIRContext &context,
                 callOp->getAttr("name").cast<mlir::StringAttr>().getValue()));
 
         storeOp->setAttr(std::string("to"),
-                         builder.getStringAttr(argumentNameMap[writeArgName]));
+                         builder.getStringAttr(argumentNameMap[argName]));
       }
 
-      storeMap[writeArgName] = storeOp;
-      loadedStencilsMap[writeArgName] = callOp->getResult(index);
+      storeMap[argName] = storeOp;
+      loadedStencilsMap[argName] = callOp->getResult(index);
     }
   }
 
@@ -771,7 +685,7 @@ int main(int argc, char **argv) {
   }
 
   // remove unnsecessary stores for intermediary stencils results
-  if (enableInline || enableDebug) {
+  if (enableInline) {
     newModule->walk([&](mlir::stencil::StoreOp storeOp) {
       if (!storeOp.temp().hasOneUse()) {
         storeOp.erase();
@@ -779,41 +693,55 @@ int main(int argc, char **argv) {
     });
   }
 
-  llvm::SmallVector<StoreTemp, 3> storesToRestore;
+  newModule->walk([&](mlir::stencil::StoreOp storeOp) {
+    // storeOp.dump();
+    bool isStoreOverlappingInput =
+        llvm::any_of(storeOp.field().getUses(), [&](mlir::OpOperand &op) {
+          return isa<mlir::stencil::LoadOp>(op.getOwner());
+        });
 
-  if (overlappingInlineStrategy == OverlappingInlineStrategy::StrategyBuffer) {
-    newModule->walk([&](mlir::stencil::StoreOp storeOp) {
-      bool isStoreOverlappingInput =
-          llvm::any_of(storeOp.field().getUses(), [&](mlir::OpOperand &op) {
-            return isa<mlir::stencil::LoadOp>(op.getOwner());
-          });
+    if (isStoreOverlappingInput && enableInline) {
+      auto builder = mainBuilder(newModule);
+      auto originalCastOp = storeOp.field().getDefiningOp();
 
-      if (isStoreOverlappingInput && (enableInline || enableDebug)) {
-        auto builder = mainBuilder(newModule);
+      auto funcOp = getMainFunc(newModule);
 
-        auto originalCastOp = storeOp.field().getDefiningOp();
+      bool found = false;
+      for (auto &en : llvm::enumerate(funcOp.getArguments())) {
+        auto arg = en.value();
+        auto argIndex = en.index();
 
-        auto funcOp = getMainFunc(newModule);
+        if (arg.use_empty()) {
 
-        std::string toName = "unknown";
+          auto castOp = builder.clone(*originalCastOp);
 
-        auto bufferOp = builder.create<mlir::stencil::BufferOp>(
-            newModule->getLoc(), storeOp.temp());
+          castOp->setOperand(0, arg);
+          auto toName = argumentNameMap[std::to_string(argIndex)];
 
-        createCopyKernel(bufferOp.getResult(), originalCastOp->getResult(0),
-                         storeOp.lbAttr(), storeOp.ubAttr(), toName, newModule);
+          if (enableAttrs) {
+            castOp->setAttr(std::string("name"), builder.getStringAttr(toName));
+          }
 
-        // StoreTemp storeTemp;
-        // storeTemp.setField(storeOp.field());
-        // storeTemp.setTemp(storeOp.temp());
-        // storeTemp.setUb(storeOp.ubAttr());
-        // storeTemp.setLb(storeOp.lbAttr());
+          auto bufferOp = builder.create<mlir::stencil::BufferOp>(
+              newModule->getLoc(), storeOp.temp());
+          createCopyKernel(bufferOp.getResult(), castOp->getResult(0),
+                           storeOp.lbAttr(), storeOp.ubAttr(), toName,
+                           newModule);
 
-        // storesToRestore.push_back(storeTemp);
+          found = true;
+          break;
+        }
+      }
+
+      if (!found) {
+        storeOp.emitError(
+            "There are no unused arguments for creating copy kernel");
+        mlir::failure(true);
+      } else {
         storeOp.erase();
       }
-    });
-  }
+    }
+  });
 
   // erase func unused arguments from main func
   SmallVector<unsigned> argumentIndexesToDelete;
@@ -830,9 +758,19 @@ int main(int argc, char **argv) {
   }
 
   // verify all applyOps has store op
-  if (verifyStorages(newModule).wasInterrupted()) {
-    return -1;
-  }
+  newModule->walk([&](mlir::stencil::ApplyOp applyOp) {
+    auto hasUnusedResult = false;
+    for (auto res : applyOp.getResults()) {
+      if (res.use_empty()) {
+        hasUnusedResult = true;
+        break;
+      }
+    }
+
+    if (hasUnusedResult) {
+      applyOp.emitOpError("expected to have usage (storage)");
+    }
+  });
 
   if (enableInline) {
     mlir::PassManager pmInline(&context);
@@ -846,76 +784,10 @@ int main(int argc, char **argv) {
     }
   }
 
-  // verify all applyOps has store op after inlining
-  if (verifyStorages(newModule).wasInterrupted()) {
-    return -1;
-  }
-
-  if (overlappingInlineStrategy ==
-      OverlappingInlineStrategy::StrategyOverwrite) {
-    newModule->walk([&](mlir::stencil::StoreOp storeOp) {
-      bool isStoreOverlappingInput =
-          llvm::any_of(storeOp.field().getUses(), [&](mlir::OpOperand &op) {
-            return isa<mlir::stencil::LoadOp>(op.getOwner());
-          });
-
-      if (isStoreOverlappingInput && (enableInline || enableDebug)) {
-        auto builder = mainBuilder(newModule);
-        auto builderFront = mainBuilderFront(newModule);
-
-        auto originalCastOp = storeOp.field().getDefiningOp();
-
-        auto funcOp = getMainFunc(newModule);
-
-        bool found = false;
-        for (auto &en : llvm::enumerate(funcOp.getArguments())) {
-          auto arg = en.value();
-          auto argIndex = en.index();
-
-          if (arg.use_empty()) {
-            auto castOp = builderFront.clone(*originalCastOp);
-
-            castOp->setOperand(0, arg);
-            auto toName = argumentNameMap[std::to_string(argIndex)];
-
-            if (enableAttrs) {
-              castOp->setAttr(std::string("name"),
-                              builder.getStringAttr(toName));
-            }
-
-            storeOp.setOperand(1,
-                               cast<mlir::stencil::CastOp>(castOp).getResult());
-            if (enableAttrs) {
-              storeOp->setAttr(std::string("to"),
-                               builder.getStringAttr(toName));
-            }
-            found = true;
-            break;
-          }
-        }
-
-        if (!found) {
-          storeOp.emitOpError("There are no unused arguments left");
-        }
-      }
-    });
-  }
-
-  // if (enableInline) {
-  //   newModule->walk([&](mlir::stencil::BufferOp bufferOp) {
-  //     bufferOp.replaceAllUsesWith(bufferOp.getOperand());
-  //     bufferOp.erase();
-  //   });
-  // }
-
   if (emitAction >= Action::DumpStencilShapes) {
     pm.addNestedPass<mlir::FuncOp>(mlir::createShapeInferencePass());
     pm.addPass(mlir::createCSEPass());
     pm.addPass(mlir::createCanonicalizerPass());
-  }
-
-  if (target == CUBIN) {
-    // todo cuda path..
   }
 
   if (emitAction >= Action::DumpStandard) {
@@ -947,7 +819,7 @@ int main(int argc, char **argv) {
     newModule->print(llvm::outs());
     return 0;
   } else if (emitAction == DumpLLVMIR) {
-    return translateAndPrintLLVMIR(*newModule);
+    return translateAndPrintLLVMIR(*module);
   }
 
   return 0;

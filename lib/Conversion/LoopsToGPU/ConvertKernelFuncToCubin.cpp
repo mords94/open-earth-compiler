@@ -12,13 +12,13 @@
 #include "mlir/Transforms/Passes.h"
 #include "llvm/Support/TargetSelect.h"
 
-#ifdef CUDA_BACKEND_ENABLED
+// #ifdef CUDA_BACKEND_ENABLED
 #include "cuda.h"
 
 using namespace mlir;
 
 constexpr char tripleName[] = "nvptx64-nvidia-cuda";
-constexpr char targetChip[] = "sm_35";
+constexpr char targetChip[] = "sm_60";
 constexpr char features[] = "+ptx60";
 constexpr char gpuBinaryAnnotation[] = "nvvm.cubin";
 
@@ -122,4 +122,4 @@ void registerGPUToCUBINPipeline() {
       });
 }
 } // namespace mlir
-#endif
+  // #endif

@@ -31,7 +31,9 @@
 #include "llvm/Support/raw_ostream.h"
 #include <cstdint>
 #include <functional>
+#include <iostream>
 #include <iterator>
+#include <string>
 #include <tuple>
 
 using namespace mlir;
@@ -609,7 +611,15 @@ void StencilToStandardPass::runOnOperation() {
           storageOps++;
         }
       }
+
       if (storageOps != 1) {
+        for (auto user : result.getUsers()) {
+          if (isa<stencil::BufferOp>(user) || isa<stencil::StoreOp>(user)) {
+            user->dump();
+          }
+        }
+        applyOp.emitOpError("applyOp storageOp count is: " +
+                            std::to_string(storageOps) + " result is");
         applyOp.emitOpError("expected apply op results to have storage");
         return WalkResult::interrupt();
       }
